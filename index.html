@@ -21,6 +21,12 @@
   .seg button.on { background:var(--acc) }
   #q { width:100%; padding:11px 16px; border-radius:999px; border:0; background:var(--chip); color:var(--fg); font:inherit; font-size:13px; outline:none; margin-bottom:20px }
   #q:focus { box-shadow:0 0 0 2px var(--acc) }
+  #q { margin-bottom:8px }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; justify-content:center; margin-bottom:8px }
+  .chips button { padding:5px 10px; font-size:11px; font-weight:400; color:var(--mut) }
+  .chips button:hover { color:var(--fg) }
+  #ai { color:var(--mut); font-size:11px; min-height:14px; margin-bottom:14px }
+  .pct { color:var(--acc); font-size:11px; font-weight:600; flex:none !important }
   .disc { width:110px; height:110px; border-radius:50%; margin:0 auto 16px; background:conic-gradient(#ff4d8d,#7a4dff,#4dd2ff,#ff4d8d) }
   .disc.spin { animation:spin 4s linear infinite }
   @keyframes spin { to { transform:rotate(360deg) } }
@@ -54,6 +60,8 @@
       <button data-m="instr" data-i18n="instr"></button>
     </div>
     <input id="q" type="search" data-i18n-ph="ph">
+    <div class="chips" id="chips"></div>
+    <div id="ai"></div>
 
     <div class="disc" id="disc"></div>
     <p id="title">—</p>
@@ -65,6 +73,7 @@
       <button id="prev" data-i18n="prev"></button>
       <button id="like"></button>
       <button id="dl" data-i18n="dl"></button>
+      <button id="sim" data-i18n="sim"></button>
       <button id="next" data-i18n="next"></button>
     </div>
   </div>
@@ -88,7 +97,11 @@ const dec = new TextDecoder();
 const I = {
   en: {
     all: "All", vocal: "🎤 With vocals", instr: "🎹 Instrumental",
-    ph: "Search by word (genre, title, lyrics) + Enter",
+    ph: "Describe a vibe, mood or theme + Enter",
+    sim: "≈ Similar", simTo: x => `≈ Similar to “${x}”`,
+    examples: ["rainy night lo-fi", "epic battle music", "sad song about lost love", "music for a workout", "dreamy synthwave drive", "lullaby"],
+    aiLoading: p => `🧠 Loading the semantic search model… ${p}% (one time, ~118 MB)`,
+    aiReady: "🧠 Semantic search: looks for meaning, in any language", aiFailed: "Semantic model unavailable — searching by exact words",
     prev: "⏮ Back", like: "♡ Like", liked: "♥ Saved", dl: "⬇ Save", next: "Next ⏭",
     sub: "Every track made by AI. Press next. Keep what you love.",
     saved: "Saved ❤", savedEmpty: "Nothing yet — like something.",
@@ -96,12 +109,16 @@ const I = {
     waiting: m => `Waiting for the first match… scanned ${m}`,
     searching: "Looking for a track…", loading: "Loading track…",
     error: "Loading failed. Press “Next”.",
-    track: (src, v, fb, hint) => `${src} · ${v === true ? "🎤 with vocals" : v === false ? "🎹 instrumental" : "vocals: unknown"}` + (fb ? " · from already known (search continues)" : "") + (hint ? " · press ▶" : ""),
+    track: (src, v, fb, hint, pct) => `${src} · ${v === true ? "🎤 with vocals" : v === false ? "🎹 instrumental" : "vocals: unknown"}` + (pct != null ? ` · ${pct}% match` : "") + (fb ? " · from already known (search continues)" : "") + (hint ? " · press ▶" : ""),
     noTitle: "Untitled", limit: "Close to the Hugging Face rate limit — short pause",
   },
   uk: {
     all: "Усі", vocal: "🎤 Зі словами", instr: "🎹 Без слів",
-    ph: "Пошук за словом (жанр, назва, текст) + Enter",
+    ph: "Опиши настрій, жанр чи тему + Enter",
+    sim: "≈ Схожі", simTo: x => `≈ Схожі на «${x}»`,
+    examples: ["сумна пісня про дощ", "епічна музика для бою", "щось для тренування", "нічна поїздка, синтвейв", "лагідна колискова", "пісня про кохання українською"],
+    aiLoading: p => `🧠 Завантажую модель смислового пошуку… ${p}% (один раз, ~118 МБ)`,
+    aiReady: "🧠 Смисловий пошук: шукає за змістом, будь-якою мовою", aiFailed: "Модель недоступна — шукаю за точними словами",
     prev: "⏮ Назад", like: "♡ Лайк", liked: "♥ Збережено", dl: "⬇ Зберегти", next: "Далі ⏭",
     sub: "Кожен трек створений ШІ. Тисни «Далі». Лишай, що сподобалось.",
     saved: "Збережене ❤", savedEmpty: "Поки порожньо — лайкни щось.",
@@ -109,7 +126,7 @@ const I = {
     waiting: m => `Чекаю на перший збіг… переглянуто ${m}`,
     searching: "Шукаю трек…", loading: "Завантажую трек…",
     error: "Помилка завантаження. Натисни «Далі».",
-    track: (src, v, fb, hint) => `${src} · ${v === true ? "🎤 зі словами" : v === false ? "🎹 без слів" : "слова: невідомо"}` + (fb ? " · з уже відомих (новий пошук триває)" : "") + (hint ? " · натисни ▶" : ""),
+    track: (src, v, fb, hint, pct) => `${src} · ${v === true ? "🎤 зі словами" : v === false ? "🎹 без слів" : "слова: невідомо"}` + (pct != null ? ` · збіг ${pct}%` : "") + (fb ? " · з уже відомих (новий пошук триває)" : "") + (hint ? " · натисни ▶" : ""),
     noTitle: "Без назви", limit: "Близько до ліміту Hugging Face — коротка пауза",
   },
 };
@@ -127,7 +144,8 @@ function applyLang() {
   document.querySelectorAll("[data-i18n-ph]").forEach(e => e.placeholder = t(e.dataset.i18nPh));
   document.querySelectorAll("#lang button").forEach(b => b.classList.toggle("on", b.dataset.l === lang));
   if (statusArgs) $("status").textContent = t(...statusArgs);
-  renderQueue(); render(); updateLike();
+  if (aiState) $("ai").textContent = t(...aiState);
+  renderChips(); renderQueue(); render(); updateLike();
 }
 
 let mode = "all", current = null, token = 0, objUrl = null;
@@ -249,14 +267,71 @@ function normalize(m, source) {
   }
   tags = tags.map(s => String(s).trim()).filter(Boolean);
   const title = (m.title || t("noTitle")).trim();
-  return { title, tags, vocals, haystack: [title, tags.join(" "), lyrics || "", m.description || ""].join(" ").toLowerCase() };
+  // для моделі: назва, теги, опис і початок тексту без службових [Verse]/[Chorus]
+  const words = String(lyrics || "").replace(/\[[^\]]*\]/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
+  const doc = [title, tags.join(", "), m.description || "", words].filter(Boolean).join(". ");
+  return { title, tags, vocals, doc, haystack: [title, tags.join(" "), lyrics || "", m.description || ""].join(" ").toLowerCase() };
 }
 
-const matches = (n, term) => {
-  if (mode === "vocal" && n.vocals !== true) return false;
-  if (mode === "instr" && n.vocals !== false) return false;
-  return !term || term.split(/\s+/).every(w => n.haystack.includes(w));
-};
+// ---------- смисловий (semantic) пошук ----------
+// Багатомовна embedding-модель прямо в браузері (transformers.js, ONNX/WASM): запит і опис треку
+// перетворюються на вектори, схожість = косинус. Українські запити знаходять англійські теги й навпаки.
+const MODEL = "Xenova/paraphrase-multilingual-MiniLM-L12-v2";
+const MIN_SIM = 0.4;      // нижче цього — вже не про те
+const TOP_SHARE = 0.2;    // і серед переглянутих беремо лише найкращі ~20%
+const MIN_SCAN = 120;     // при смисловому пошуку не зупиняємось на перших збігах — є з чого вибрати найкращі
+const KEEP = 15;          // скільки найкращих кандидатів тримаємо в черзі
+let embedder = null, aiState = null;
+function setAi(...a) { aiState = a.length ? a : null; $("ai").textContent = a.length ? t(...a) : ""; }
+function loadModel() {
+  if (embedder) return embedder;
+  setAi("aiLoading", 0);
+  const files = {};
+  embedder = import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.0")
+    .then(({ pipeline }) => pipeline("feature-extraction", MODEL, {
+      dtype: "q8",
+      progress_callback: p => {
+        if (p.status !== "progress" || !p.total) return;
+        files[p.file] = [p.loaded, p.total];
+        const [l, tot] = Object.values(files).reduce((a, [x, y]) => [a[0] + x, a[1] + y], [0, 0]);
+        setAi("aiLoading", Math.floor(100 * l / tot));
+      },
+    }))
+    .then(p => { setAi("aiReady"); return p; })
+    .catch(e => { console.warn("semantic model:", e); setAi("aiFailed"); return null; });
+  return embedder;
+}
+async function embed(texts) {
+  const p = await loadModel();
+  return p ? (await p(texts, { pooling: "mean", normalize: true })).tolist() : null;
+}
+const docOf = n => n.doc || [n.title, (n.tags || []).join(", ")].join(". ");
+async function embedTracks(list) {
+  const need = list.filter(x => !x.emb);
+  if (!need.length) return;
+  const v = await embed(need.map(docOf));
+  if (v) need.forEach((x, i) => x.emb = v[i]);
+}
+const dot = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
+
+const passesMode = n => !(mode === "vocal" && n.vocals !== true) && !(mode === "instr" && n.vocals !== false);
+const keywordHit = n => !!curTerm && curTerm.split(/\s+/).every(w => (n.haystack || n.title.toLowerCase()).includes(w));
+// релевантність: null — не підходить; без запиту — 1
+function relevance(n) {
+  if (!passesMode(n)) return null;
+  if (!curTerm && !simTo) return 1;
+  if (qvec && n.emb) return dot(qvec, n.emb) + (keywordHit(n) ? 0.1 : 0);   // точний збіг слів — невеликий бонус
+  if (qvec || !curTerm) return null;     // вектора треку ще нема / «схожі» без моделі
+  return keywordHit(n) ? 1 : null;       // модель недоступна — старий пошук за словами
+}
+// поріг адаптивний: не нижче MIN_SIM і не гірше за топ-20% усього переглянутого в цьому пошуку
+function threshold() {
+  if (!qvec) return 1;
+  if (seen.length < 20) return MIN_SIM;
+  const s = [...seen].sort((a, b) => b - a);
+  return Math.max(MIN_SIM, s[Math.floor(s.length * TOP_SHARE)]);
+}
+const pctOf = n => qvec && n.score != null ? Math.round(Math.min(1, n.score) * 100) : null;
 
 // ---------- вибір треку ----------
 // одне випадкове місце в tar → кілька сусідніх треків з метаданими (дешево: по одному маленькому запиту на трек)
@@ -276,12 +351,19 @@ async function probeRun(sources) {
 // ---------- фонова черга: пошук іде постійно, знайдене складається в чергу ----------
 const WORKERS = 6;
 let fallbackUsed = false, queue = [], gen = 0, scanned = 0, curTerm = "", curSources = SOURCES;
+let simTo = null, qvec = null, qReady = Promise.resolve(), seen = [];
 const pool = [];   // усі переглянуті треки (навіть ті, що не підійшли під фільтр) — запасний варіант для «Далі»
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-function resetQueue() {
-  gen++; queue = []; scanned = 0;
+function resetQueue(similar) {
+  const g = ++gen; queue = []; scanned = 0; seen = []; qvec = null;
+  simTo = similar || null;
+  if (simTo) $("q").value = "";
   curTerm = $("q").value.trim().toLowerCase();
+  // вектор запиту: текст із поля або сам трек («Схожі»)
+  qReady = !curTerm && !simTo ? Promise.resolve()
+    : simTo && simTo.emb ? Promise.resolve(qvec = simTo.emb)
+    : embed([simTo ? docOf(simTo) : curTerm]).then(v => { if (g === gen && v) qvec = v[0]; }).catch(() => {});
   // у Mureka немає ні текстів, ні ознаки «інструментал» — їх пропускаємо при фільтрі
   curSources = mode !== "all" ? SOURCES.filter(s => s !== "mureka") : SOURCES;
   renderQueue();
@@ -291,31 +373,41 @@ function resetQueue() {
 async function worker(g) {
   const target = 5;
   while (g === gen) {
-    if (queue.length >= target) { await sleep(500); continue; }
+    if (queue.length >= target && !(qvec && scanned < MIN_SCAN)) { await sleep(500); continue; }
     const list = await probeRun(curSources).catch(() => []);
+    await qReady;
+    if (qvec) await embedTracks(list).catch(() => {});
     if (g !== gen) return;
     for (const t of list) {
       scanned++;
       pool.push(t); if (pool.length > 300) pool.shift();
-      if (matches(t, curTerm) && !queue.some(x => same(x, t)) && !(current && same(current, t))) queue.push(t);
+      const s = relevance(t);
+      if (s === null) continue;
+      if (qvec) seen.push(s);
+      if (s < threshold() || queue.some(x => same(x, t)) || (current && same(current, t)) || (simTo && same(simTo, t))) continue;
+      queue.push({ ...t, score: s });
     }
+    if (qvec) { queue.sort((a, b) => b.score - a.score); queue.length = Math.min(queue.length, KEEP); }   // найкращі збіги — першими
     renderQueue();
   }
 }
 
 // якщо черга порожня — не чекаємо, а граємо будь-який відомий трек (лайки, історія, переглянуте), перевагу мають ті, що підходять під фільтр
 function fallbackTrack(onlyFit) {
-  const known = [...loadLikes(), ...history, ...pool].filter(x => !(current && same(x, current)));
+  const known = [...loadLikes(), ...history, ...pool].filter(x => !(current && same(x, current)) && !(simTo && same(x, simTo)));
   if (!known.length) return null;
-  const fit = known.filter(x => matches(x, curTerm));
+  // з уже відомих — найближчі за змістом (випадково з п'яти найкращих)
+  const fit = known.map(x => ({ ...x, score: relevance(x) })).filter(x => x.score !== null && x.score >= (qvec ? MIN_SIM : 1))
+    .sort((a, b) => b.score - a.score).slice(0, 5);
   if (onlyFit && !fit.length) return null;
   const src = fit.length ? fit : known;
   return src[Math.floor(Math.random() * src.length)];
 }
 
 async function takeNext(my) {
+  if (queue.length === 0) { setStatus("waiting", scanned); await qReady; }   // модель може ще вантажитись — таймер чекання від моменту, коли запит готовий
   const start = Date.now();
-  const filtered = mode !== "all" || curTerm;
+  const filtered = mode !== "all" || curTerm || simTo;
   while (my === token) {
     if (queue.length) { const t = queue.shift(); renderQueue(); return t; }
     // з активним пошуком чекаємо на знайдене; випадковий трек — лише якщо пошуку нема або він довго нічого не знаходить
@@ -327,14 +419,27 @@ async function takeNext(my) {
   return undefined;
 }
 
+function renderChips() {
+  const box = $("chips");
+  box.innerHTML = "";
+  t("examples").forEach(x => {
+    const b = document.createElement("button");
+    b.textContent = x;
+    b.onclick = () => { $("q").value = x; resetQueue(); next(); };
+    box.appendChild(b);
+  });
+}
+
 function renderQueue() {
-  $("found").textContent = t("found", queue.length, scanned);
+  $("found").textContent = (simTo ? t("simTo", simTo.title) + " · " : "") + t("found", queue.length, scanned);
   const ul = $("queue");
   ul.innerHTML = queue.length ? "" : `<li class="empty">${t("searchingLi")}</li>`;
   queue.forEach(t => {
     const li = document.createElement("li");
-    li.innerHTML = `<span></span><button>▶</button>`;
+    const pct = pctOf(t);
+    li.innerHTML = `<span></span>${pct != null ? `<span class="pct">${pct}%</span>` : ""}<button>▶</button>`;
     li.firstChild.textContent = t.title + (t.tags.length ? " — " + t.tags.slice(0, 2).join(", ") : "");
+    li.title = t.tags.join(", ");
     li.querySelector("button").onclick = () => { queue = queue.filter(x => x !== t); renderQueue(); next(t); };
     ul.appendChild(li);
   });
@@ -356,17 +461,17 @@ async function show(t, my, back) {
   const blob = new Blob([bytes], { type: MIME[t.ext] });
   if (objUrl) URL.revokeObjectURL(objUrl);
   objUrl = URL.createObjectURL(blob);
-  if (current && !back) { const { blob: _b, ...meta } = current; history.push(meta); if (history.length > 50) history.shift(); }
+  if (current && !back) { const { blob: _b, emb: _e, score: _s, ...meta } = current; history.push(meta); if (history.length > 50) history.shift(); }
   current = { ...t, blob };
   updatePrev();
   audio.src = objUrl;
   $("title").textContent = t.title;
   $("tags").textContent = t.tags.slice(0, 6).join(" · ");
   const sa = ["track", t.source, t.vocals, fallbackUsed];
-  setStatus(...sa, false);
+  setStatus(...sa, false, pctOf(t));
   fallbackUsed = false;
   updateLike();
-  audio.play().catch(() => setStatus(...sa, true));
+  audio.play().catch(() => setStatus(...sa, true, pctOf(t)));
 }
 
 async function next(fixed, back) {
@@ -427,6 +532,8 @@ $("seg").onclick = e => {
   resetQueue(); next();
 };
 $("q").onkeydown = e => { if (e.key === "Enter") { resetQueue(); next(); } };
+$("q").onfocus = () => loadModel();   // модель важка — починаємо тягнути, щойно людина збирається шукати
+$("sim").onclick = () => { if (current) { resetQueue(current); next(); } };
 $("next").onclick = () => next();
 // як у звичайних плеєрах: якщо трек грає вже кілька секунд або історія порожня — починаємо його спочатку, інакше йдемо до попереднього
 $("lang").onclick = e => {
