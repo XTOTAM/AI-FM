@@ -14,7 +14,7 @@ dataset (~870K songs from Suno, Udio, Riffusion, Mureka and Sonauto). No backend
 - **Live queue**: matches are collected in the background; the page shows how many were found and you can play any of them right away.
 - **Like** ♥ to keep a track in the *Saved* list, **Save** ⬇ to download the audio file.
 - **Back** ⏮ goes to the previous track (restarts the current one if it has played for more than 3 s).
-- **EN / UA** language switch (English by default, choice is remembered).
+- **EN / UA** language switch (picked from the browser language: Ukrainian → UA, anything else → EN; manual choice is remembered).
 - Volume slider; volume, likes and history are stored in `localStorage`.
 
 ## Run

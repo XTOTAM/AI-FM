@@ -114,7 +114,9 @@ const I = {
   },
 };
 const LANG_KEY = "genmus.lang";
-let lang = "en";
+// мова: збережений вибір користувача → мова браузера (uk → UA) → англійська
+const pref = (navigator.languages || [navigator.language]).map(l => String(l).slice(0, 2).toLowerCase()).find(l => I[l]);
+let lang = pref || "en";
 try { const l = localStorage.getItem(LANG_KEY); if (I[l]) lang = l; } catch {}
 const t = (k, ...a) => { const v = I[lang][k]; return typeof v === "function" ? v(...a) : v; };
 let statusArgs = null;
