@@ -285,42 +285,84 @@ const MIN_SCAN = 120;     // при смисловому пошуку не зу�
 const KEEP = 15;          // скільки найкращих кандидатів тримаємо в черзі
 let embedder = null, aiState = null;
 function setAi(...a) { aiState = a.length ? a : null; $("ai").textContent = a.length ? t(...a) : ""; }
+// Модель крутиться у Web Worker, щоб WASM-обчислення не вішали інтерфейс під час набору запиту
+const MODEL_WORKER = `
+import { pipeline } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.0";
+const files = {};
+let p;
+try {
+  p = await pipeline("feature-extraction", ${JSON.stringify(MODEL)}, {
+    dtype: "q8",
+    progress_callback: x => {
+      if (x.status !== "progress" || !x.total) return;
+      files[x.file] = [x.loaded, x.total];
+      const [l, tot] = Object.values(files).reduce((a, [u, v]) => [a[0] + u, a[1] + v], [0, 0]);
+      postMessage({ type: "progress", pct: Math.floor(100 * l / tot) });
+    },
+  });
+  postMessage({ type: "ready" });
+} catch (e) { postMessage({ type: "failed", error: String(e) }); }
+onmessage = async ({ data }) => {
+  try { postMessage({ type: "result", id: data.id, vecs: (await p(data.texts, { pooling: "mean", normalize: true })).tolist() }); }
+  catch (e) { postMessage({ type: "result", id: data.id, vecs: null }); }
+};`;
+const calls = new Map();
+let callId = 0;
 function loadModel() {
   if (embedder) return embedder;
   setAi("aiLoading", 0);
-  const files = {};
-  embedder = import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.0")
-    .then(({ pipeline }) => pipeline("feature-extraction", MODEL, {
-      dtype: "q8",
-      progress_callback: p => {
-        if (p.status !== "progress" || !p.total) return;
-        files[p.file] = [p.loaded, p.total];
-        const [l, tot] = Object.values(files).reduce((a, [x, y]) => [a[0] + x, a[1] + y], [0, 0]);
-        setAi("aiLoading", Math.floor(100 * l / tot));
-      },
-    }))
-    .then(p => { setAi("aiReady"); return p; })
-    .catch(e => { console.warn("semantic model:", e); setAi("aiFailed"); return null; });
+  embedder = new Promise(resolve => {
+    const fail = e => { console.warn("semantic model:", e); setAi("aiFailed"); resolve(null); };
+    let w;
+    try { w = new Worker(URL.createObjectURL(new Blob([MODEL_WORKER], { type: "text/javascript" })), { type: "module" }); }
+    catch (e) { return fail(e); }
+    w.onerror = e => fail(e.message || e);
+    w.onmessage = ({ data: d }) => {
+      if (d.type === "progress") setAi("aiLoading", d.pct);
+      else if (d.type === "ready") { setAi("aiReady"); resolve(w); }
+      else if (d.type === "failed") fail(d.error);
+      else if (d.type === "result") { calls.get(d.id)?.(d.vecs); calls.delete(d.id); }
+    };
+  });
   return embedder;
 }
-async function embed(texts) {
-  const p = await loadModel();
-  return p ? (await p(texts, { pooling: "mean", normalize: true })).tolist() : null;
+// Один запит до моделі за раз. Запит користувача йде поза чергою; завдання застарілого пошуку (інший gen) відкидаються
+const jobs = [];
+let pumping = false;
+function embed(texts, g, urgent) {
+  return new Promise(res => {
+    const j = { texts, g, res };
+    urgent ? jobs.unshift(j) : jobs.push(j);
+    pump();
+  });
+}
+async function pump() {
+  if (pumping) return;
+  pumping = true;
+  try {
+    const w = await loadModel();
+    while (jobs.length) {
+      const j = jobs.shift();
+      if (!w || j.g !== gen) { j.res(null); continue; }
+      const id = ++callId;
+      j.res(await new Promise(r => { calls.set(id, r); w.postMessage({ id, texts: j.texts }); }));
+    }
+  } finally { pumping = false; }
 }
 const styleOf = n => n.style ?? (n.tags || []).join(", ");
 const textOf = n => n.text ?? n.title;
 // два вектори на трек: { s: стиль (null, якщо тегів нема), t: назва + текст }
-async function embedPairs(list) {
+async function embedPairs(list, g, urgent) {
   const texts = list.flatMap(n => [styleOf(n), textOf(n)].filter(Boolean));
-  const v = await embed(texts);
+  const v = await embed(texts, g, urgent);
   if (!v) return null;
   let i = 0;
   return list.map(n => ({ s: styleOf(n) ? v[i++] : null, t: textOf(n) ? v[i++] : null }));
 }
-async function embedTracks(list) {
+async function embedTracks(list, g) {
   const need = list.filter(x => !x.emb);
   if (!need.length) return;
-  const v = await embedPairs(need);
+  const v = await embedPairs(need, g);
   if (v) need.forEach((x, i) => x.emb = v[i]);
 }
 // стиль зі стилем, текст із текстом; якщо однієї частини нема — рахуємо за іншою
@@ -368,10 +410,12 @@ async function probeRun(sources) {
 const WORKERS = 6;
 let fallbackUsed = false, queue = [], gen = 0, scanned = 0, curTerm = "", curSources = SOURCES;
 let simTo = null, qvec = null, qReady = Promise.resolve(), seen = [];
+let qTimer = 0;
 const pool = [];   // усі переглянуті треки (навіть ті, що не підійшли під фільтр) — запасний варіант для «Далі»
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function resetQueue(similar) {
+  clearTimeout(qTimer);
   const g = ++gen; queue = []; scanned = 0; seen = []; qvec = null;
   simTo = similar || null;
   if (simTo) $("q").value = "";
@@ -379,8 +423,8 @@ function resetQueue(similar) {
   // вектор запиту: текст із поля або сам трек («Схожі»)
   qReady = !curTerm && !simTo ? Promise.resolve()
     : simTo && simTo.emb ? Promise.resolve(qvec = simTo.emb)
-    : (simTo ? embedPairs([simTo]).then(v => v && v[0])
-       : embed([curTerm]).then(v => v && { s: v[0], t: v[0] }))   // текстовий запит порівнюємо і зі стилем, і з текстом
+    : (simTo ? embedPairs([simTo], g, true).then(v => v && v[0])
+       : embed([curTerm], g, true).then(v => v && { s: v[0], t: v[0] }))   // текстовий запит порівнюємо і зі стилем, і з текстом
       .then(q => { if (g === gen && q) qvec = q; }).catch(() => {});
   // у Mureka немає ні текстів, ні ознаки «інструментал» — їх пропускаємо при фільтрі
   curSources = mode !== "all" ? SOURCES.filter(s => s !== "mureka") : SOURCES;
@@ -394,15 +438,16 @@ async function worker(g) {
     if (queue.length >= target && !(qvec && scanned < MIN_SCAN)) { await sleep(500); continue; }
     const list = await probeRun(curSources).catch(() => []);
     await qReady;
-    if (qvec) await embedTracks(list).catch(() => {});
+    if (qvec) await embedTracks(list, g).catch(() => {});
     if (g !== gen) return;
+    let thr = threshold();
     for (const t of list) {
       scanned++;
       pool.push(t); if (pool.length > 300) pool.shift();
       const s = relevance(t);
       if (s === null) continue;
       if (qvec) seen.push(s);
-      if (s < threshold() || queue.some(x => same(x, t)) || (current && same(current, t)) || (simTo && same(simTo, t))) continue;
+      if (s < thr || queue.some(x => same(x, t)) || (current && same(current, t)) || (simTo && same(simTo, t))) continue;
       queue.push({ ...t, score: s });
     }
     if (qvec) { queue.sort((a, b) => b.score - a.score); queue.length = Math.min(queue.length, KEEP); }   // найкращі збіги — першими
@@ -548,6 +593,12 @@ $("seg").onclick = e => {
   mode = m;
   document.querySelectorAll("#seg button").forEach(b => b.classList.toggle("on", b.dataset.m === m));
   resetQueue(); next();
+};
+// дебаунс: пошук стартує, коли людина на мить перестала друкувати; Enter — одразу
+const DEBOUNCE = 600;
+$("q").oninput = () => {
+  clearTimeout(qTimer);
+  qTimer = setTimeout(() => { if (simTo || $("q").value.trim().toLowerCase() !== curTerm) { resetQueue(); next(); } }, DEBOUNCE);
 };
 $("q").onkeydown = e => { if (e.key === "Enter") { resetQueue(); next(); } };
 $("q").onfocus = () => loadModel();   // модель важка — починаємо тягнути, щойно людина збирається шукати
