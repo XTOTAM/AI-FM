@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="uk">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8,9 +8,12 @@
 <style>
   :root { --bg:#0f1020; --card:#1a1b33; --fg:#f1f1f8; --mut:#8a8ca8; --acc:#ff4d8d; --chip:#2b2c4d }
   * { box-sizing:border-box }
-  body { margin:0; background:var(--bg); color:var(--fg); font-family:"Montserrat",-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+  body { position:relative; margin:0; background:var(--bg); color:var(--fg); font-family:"Montserrat",-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
          min-height:100vh; display:flex; flex-direction:column; align-items:center; padding:24px 16px }
   h1 { font-weight:800; margin:8px 0 6px; letter-spacing:.5px }
+  .lang { position:absolute; top:16px; right:16px; display:flex; background:var(--chip); border-radius:999px; padding:2px }
+  .lang button { background:none; padding:6px 12px; font-size:11px }
+  .lang button.on { background:var(--acc) }
   .sub { color:var(--mut); font-size:13px; margin:0 0 20px; text-align:center }
   .card { background:var(--card); border-radius:20px; padding:24px; width:100%; max-width:440px; text-align:center }
   .seg { display:flex; background:var(--chip); border-radius:999px; padding:3px; margin-bottom:12px }
@@ -41,15 +44,16 @@
 </style>
 </head>
 <body>
+  <div class="lang" id="lang"><button data-l="en" class="on">EN</button><button data-l="uk">UA</button></div>
   <h1>🎧 AI FM</h1>
-  <p class="sub">Every track made by AI. Press next. Keep what you love.</p>
+  <p class="sub" data-i18n="sub"></p>
   <div class="card">
     <div class="seg" id="seg">
-      <button data-m="all" class="on">Усі</button>
-      <button data-m="vocal">🎤 Зі словами</button>
-      <button data-m="instr">🎹 Без слів</button>
+      <button data-m="all" class="on" data-i18n="all"></button>
+      <button data-m="vocal" data-i18n="vocal"></button>
+      <button data-m="instr" data-i18n="instr"></button>
     </div>
-    <input id="q" type="search" placeholder="Пошук за словом (жанр, назва, текст) + Enter">
+    <input id="q" type="search" data-i18n-ph="ph">
 
     <div class="disc" id="disc"></div>
     <p id="title">—</p>
@@ -58,17 +62,17 @@
     <audio id="audio" controls></audio>
     <div class="vol"><span id="volIcon">🔊</span><input id="vol" type="range" min="0" max="1" step="0.01" value="0.8"></div>
     <div class="row">
-      <button id="prev">⏮ Назад</button>
-      <button id="like">♡ Лайк</button>
-      <button id="dl">⬇ Зберегти</button>
-      <button id="next">Далі ⏭</button>
+      <button id="prev" data-i18n="prev"></button>
+      <button id="like"></button>
+      <button id="dl" data-i18n="dl"></button>
+      <button id="next" data-i18n="next"></button>
     </div>
   </div>
 
-  <h2 id="found">Знайдено: 0</h2>
+  <h2 id="found"></h2>
   <ul id="queue" class="lst"></ul>
 
-  <h2>Збережене ❤</h2>
+  <h2 data-i18n="saved"></h2>
   <ul id="list"></ul>
 
 <script>
@@ -79,6 +83,50 @@ const LIKES_KEY = "genmus.likes.v2";
 const $ = id => document.getElementById(id);
 const audio = $("audio");
 const dec = new TextDecoder();
+
+// ---------- i18n (English by default, switchable) ----------
+const I = {
+  en: {
+    all: "All", vocal: "🎤 With vocals", instr: "🎹 Instrumental",
+    ph: "Search by word (genre, title, lyrics) + Enter",
+    prev: "⏮ Back", like: "♡ Like", liked: "♥ Saved", dl: "⬇ Save", next: "Next ⏭",
+    sub: "Every track made by AI. Press next. Keep what you love.",
+    saved: "Saved ❤", savedEmpty: "Nothing yet — like something.",
+    found: (n, m) => `Found: ${n} · scanned ${m}`, searchingLi: "Searching…",
+    waiting: m => `Waiting for the first match… scanned ${m}`,
+    searching: "Looking for a track…", loading: "Loading track…",
+    error: "Loading failed. Press “Next”.",
+    track: (src, v, fb, hint) => `${src} · ${v === true ? "🎤 with vocals" : v === false ? "🎹 instrumental" : "vocals: unknown"}` + (fb ? " · from already known (search continues)" : "") + (hint ? " · press ▶" : ""),
+    noTitle: "Untitled", limit: "Close to the Hugging Face rate limit — short pause",
+  },
+  uk: {
+    all: "Усі", vocal: "🎤 Зі словами", instr: "🎹 Без слів",
+    ph: "Пошук за словом (жанр, назва, текст) + Enter",
+    prev: "⏮ Назад", like: "♡ Лайк", liked: "♥ Збережено", dl: "⬇ Зберегти", next: "Далі ⏭",
+    sub: "Кожен трек створений ШІ. Тисни «Далі». Лишай, що сподобалось.",
+    saved: "Збережене ❤", savedEmpty: "Поки порожньо — лайкни щось.",
+    found: (n, m) => `Знайдено: ${n} · переглянуто ${m}`, searchingLi: "Шукаю…",
+    waiting: m => `Чекаю на перший збіг… переглянуто ${m}`,
+    searching: "Шукаю трек…", loading: "Завантажую трек…",
+    error: "Помилка завантаження. Натисни «Далі».",
+    track: (src, v, fb, hint) => `${src} · ${v === true ? "🎤 зі словами" : v === false ? "🎹 без слів" : "слова: невідомо"}` + (fb ? " · з уже відомих (новий пошук триває)" : "") + (hint ? " · натисни ▶" : ""),
+    noTitle: "Без назви", limit: "Близько до ліміту Hugging Face — коротка пауза",
+  },
+};
+const LANG_KEY = "genmus.lang";
+let lang = "en";
+try { const l = localStorage.getItem(LANG_KEY); if (I[l]) lang = l; } catch {}
+const t = (k, ...a) => { const v = I[lang][k]; return typeof v === "function" ? v(...a) : v; };
+let statusArgs = null;
+function setStatus(...a) { statusArgs = a; $("status").textContent = a.length ? t(...a) : ""; }
+function applyLang() {
+  document.documentElement.lang = lang;
+  document.querySelectorAll("[data-i18n]").forEach(e => e.textContent = t(e.dataset.i18n));
+  document.querySelectorAll("[data-i18n-ph]").forEach(e => e.placeholder = t(e.dataset.i18nPh));
+  document.querySelectorAll("#lang button").forEach(b => b.classList.toggle("on", b.dataset.l === lang));
+  if (statusArgs) $("status").textContent = t(...statusArgs);
+  renderQueue(); render(); updateLike();
+}
 
 let mode = "all", current = null, token = 0, objUrl = null;
 
@@ -97,7 +145,7 @@ async function throttle() {
     while (stamps.length && stamps[0] < now - WINDOW) stamps.shift();
     const wait = Math.max(pausedUntil - now, stamps.length >= BUDGET ? stamps[0] + WINDOW - now : 0);
     if (wait <= 0) { stamps.push(now); return; }
-    $("found").title = "Близько до ліміту Hugging Face — коротка пауза";
+    $("found").title = t("limit");
     await new Promise(r => setTimeout(r, Math.min(wait, 2000)));
   }
 }
@@ -198,7 +246,7 @@ function normalize(m, source) {
     tags = [...asList(m.genres), ...asList(m.moods)];
   }
   tags = tags.map(s => String(s).trim()).filter(Boolean);
-  const title = (m.title || "Без назви").trim();
+  const title = (m.title || t("noTitle")).trim();
   return { title, tags, vocals, haystack: [title, tags.join(" "), lyrics || "", m.description || ""].join(" ").toLowerCase() };
 }
 
@@ -268,16 +316,16 @@ async function takeNext(my) {
     if (queue.length) { const t = queue.shift(); renderQueue(); return t; }
     const f = fallbackTrack();
     if (f) { fallbackUsed = true; return f; }
-    $("status").textContent = `Чекаю на перший збіг… переглянуто ${scanned}`;
+    setStatus("waiting", scanned);
     await sleep(300);
   }
   return undefined;
 }
 
 function renderQueue() {
-  $("found").textContent = `Знайдено: ${queue.length} · переглянуто ${scanned}`;
+  $("found").textContent = t("found", queue.length, scanned);
   const ul = $("queue");
-  ul.innerHTML = queue.length ? "" : '<li class="empty">Шукаю…</li>';
+  ul.innerHTML = queue.length ? "" : `<li class="empty">${t("searchingLi")}</li>`;
   queue.forEach(t => {
     const li = document.createElement("li");
     li.innerHTML = `<span></span><button>▶</button>`;
@@ -289,7 +337,6 @@ function renderQueue() {
 
 // ---------- відтворення ----------
 const MIME = { mp3: "audio/mpeg", m4a: "audio/mp4", ogg: "audio/ogg" };
-const label = v => v === true ? "🎤 зі словами" : v === false ? "🎹 без слів" : "слова: невідомо";
 
 const HIST_KEY = "genmus.history";
 let history = [];   // вже програні треки (без аудіо), щоб можна було повернутися назад; переживає перезавантаження
@@ -298,7 +345,7 @@ function saveHistory() { try { localStorage.setItem(HIST_KEY, JSON.stringify(his
 function updatePrev() { saveHistory(); }
 
 async function show(t, my, back) {
-  $("status").textContent = "Завантажую трек…";
+  setStatus("loading");
   const bytes = await range(t.path, t.pos + 512, t.pos + 511 + t.size);
   if (my !== token) return;
   const blob = new Blob([bytes], { type: MIME[t.ext] });
@@ -310,22 +357,23 @@ async function show(t, my, back) {
   audio.src = objUrl;
   $("title").textContent = t.title;
   $("tags").textContent = t.tags.slice(0, 6).join(" · ");
-  $("status").textContent = `${t.source} · ${label(t.vocals)}` + (fallbackUsed ? " · з уже відомих (новий пошук триває)" : "");
+  const sa = ["track", t.source, t.vocals, fallbackUsed];
+  setStatus(...sa, false);
   fallbackUsed = false;
   updateLike();
-  audio.play().catch(() => { $("status").textContent += " · натисни ▶" });
+  audio.play().catch(() => setStatus(...sa, true));
 }
 
 async function next(fixed, back) {
   const my = ++token;
   $("disc").classList.remove("spin");
-  $("status").textContent = "Шукаю трек…";
+  setStatus("searching");
   try {
     const t = fixed || await takeNext(my);
     if (my !== token || t === undefined) return;
     await show(t, my, back);
   } catch (e) {
-    if (my === token) $("status").textContent = "Помилка завантаження. Натисни «Далі».";
+    if (my === token) setStatus("error");
   }
 }
 
@@ -334,11 +382,11 @@ const same = (a, b) => a.path === b.path && a.pos === b.pos;
 function updateLike() {
   const on = current && loadLikes().some(x => same(x, current));
   $("like").classList.toggle("on", !!on);
-  $("like").textContent = on ? "♥ Збережено" : "♡ Лайк";
+  $("like").textContent = on ? t("liked") : t("like");
 }
 function render() {
   const likes = loadLikes(), ul = $("list");
-  ul.innerHTML = likes.length ? "" : '<li class="empty">Поки порожньо — лайкни щось.</li>';
+  ul.innerHTML = likes.length ? "" : `<li class="empty">${t("savedEmpty")}</li>`;
   likes.forEach(x => {
     const li = document.createElement("li");
     li.innerHTML = `<span></span><button>▶</button><button>✕</button>`;
@@ -376,6 +424,11 @@ $("seg").onclick = e => {
 $("q").onkeydown = e => { if (e.key === "Enter") { resetQueue(); next(); } };
 $("next").onclick = () => next();
 // як у звичайних плеєрах: якщо трек грає вже кілька секунд або історія порожня — починаємо його спочатку, інакше йдемо до попереднього
+$("lang").onclick = e => {
+  const l = e.target.dataset.l; if (!l || l === lang) return;
+  lang = l; try { localStorage.setItem(LANG_KEY, l) } catch {}
+  applyLang();
+};
 $("prev").onclick = () => {
   if (history.length && !(current && audio.currentTime > 3)) { next(history.pop(), true); updatePrev(); }
   else if (current) { audio.currentTime = 0; audio.play().catch(() => {}); }
@@ -396,7 +449,7 @@ $("volIcon").onclick = () => setVol(audio.volume > 0 ? 0 : 0.8);
 let v0 = 0.8; try { v0 = parseFloat(localStorage.getItem(VOL_KEY)); if (isNaN(v0)) v0 = 0.8 } catch {}
 setVol(v0);
 
-render();
+applyLang();
 resetQueue();
 next();
 </script>
