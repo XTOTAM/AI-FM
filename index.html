@@ -289,8 +289,7 @@ function resetQueue() {
 }
 
 async function worker(g) {
-  const filtered = mode !== "all" || curTerm;
-  const target = filtered ? 10 : 3;
+  const target = 5;
   while (g === gen) {
     if (queue.length >= target) { await sleep(500); continue; }
     const list = await probeRun(curSources).catch(() => []);
@@ -305,18 +304,22 @@ async function worker(g) {
 }
 
 // якщо черга порожня — не чекаємо, а граємо будь-який відомий трек (лайки, історія, переглянуте), перевагу мають ті, що підходять під фільтр
-function fallbackTrack() {
+function fallbackTrack(onlyFit) {
   const known = [...loadLikes(), ...history, ...pool].filter(x => !(current && same(x, current)));
   if (!known.length) return null;
   const fit = known.filter(x => matches(x, curTerm));
+  if (onlyFit && !fit.length) return null;
   const src = fit.length ? fit : known;
   return src[Math.floor(Math.random() * src.length)];
 }
 
 async function takeNext(my) {
+  const start = Date.now();
+  const filtered = mode !== "all" || curTerm;
   while (my === token) {
     if (queue.length) { const t = queue.shift(); renderQueue(); return t; }
-    const f = fallbackTrack();
+    // з активним пошуком чекаємо на знайдене; випадковий трек — лише якщо пошуку нема або він довго нічого не знаходить
+    const f = fallbackTrack(filtered && Date.now() - start < 15000);
     if (f) { fallbackUsed = true; return f; }
     setStatus("waiting", scanned);
     await sleep(300);
