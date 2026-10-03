@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI FM</title>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#0f1020; --card:#1a1b33; --fg:#f1f1f8; --mut:#8a8ca8; --acc:#ff4d8d; --chip:#2b2c4d }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:"Montserrat",-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+         min-height:100vh; display:flex; flex-direction:column; align-items:center; padding:24px 16px }
+  h1 { font-weight:800; margin:8px 0 6px; letter-spacing:.5px }
+  .sub { color:var(--mut); font-size:13px; margin:0 0 20px; text-align:center }
+  .card { background:var(--card); border-radius:20px; padding:24px; width:100%; max-width:440px; text-align:center }
+  .seg { display:flex; background:var(--chip); border-radius:999px; padding:3px; margin-bottom:12px }
+  .seg button { flex:1; background:none; padding:9px 6px; font-size:12px }
+  .seg button.on { background:var(--acc) }
+  #q { width:100%; padding:11px 16px; border-radius:999px; border:0; background:var(--chip); color:var(--fg); font:inherit; font-size:13px; outline:none; margin-bottom:20px }
+  #q:focus { box-shadow:0 0 0 2px var(--acc) }
+  .disc { width:110px; height:110px; border-radius:50%; margin:0 auto 16px; background:conic-gradient(#ff4d8d,#7a4dff,#4dd2ff,#ff4d8d) }
+  .disc.spin { animation:spin 4s linear infinite }
+  @keyframes spin { to { transform:rotate(360deg) } }
+  #title { font-weight:600; margin:0 0 4px; font-size:16px; word-break:break-word }
+  #tags { color:var(--mut); font-size:12px; margin-bottom:6px; word-break:break-word }
+  #status { color:var(--mut); font-size:12px; min-height:16px; margin-bottom:12px }
+  audio { width:100%; margin-bottom:16px }
+  .vol { display:flex; align-items:center; gap:10px; margin-bottom:16px }
+  .vol input { flex:1; accent-color:var(--acc) }
+  .row { display:flex; gap:8px; justify-content:center; flex-wrap:wrap }
+  button { font:inherit; font-weight:600; border:0; border-radius:999px; padding:11px 18px; cursor:pointer; color:var(--fg); background:var(--chip) }
+  button:hover { filter:brightness(1.2) }
+  button:disabled { opacity:.5; cursor:default }
+  #like.on { background:var(--acc) }
+  h2 { font-size:15px; margin:28px 0 10px; color:var(--mut); font-weight:600 }
+  .lst, #list { width:100%; max-width:440px; list-style:none; padding:0; margin:0 }
+  .lst li, #list li { background:var(--card); border-radius:12px; padding:10px 14px; margin-bottom:8px; display:flex; align-items:center; gap:10px; font-size:13px }
+  .lst li span, #list li span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+  .lst button, #list button { padding:6px 12px; font-size:12px }
+  .empty { color:var(--mut) }
+</style>
+</head>
+<body>
+  <h1>🎧 AI FM</h1>
+  <p class="sub">Every track made by AI. Press next. Keep what you love.</p>
+  <div class="card">
+    <div class="seg" id="seg">
+      <button data-m="all" class="on">Усі</button>
+      <button data-m="vocal">🎤 Зі словами</button>
+      <button data-m="instr">🎹 Без слів</button>
+    </div>
+    <input id="q" type="search" placeholder="Пошук за словом (жанр, назва, текст) + Enter">
+
+    <div class="disc" id="disc"></div>
+    <p id="title">—</p>
+    <div id="tags"></div>
+    <div id="status"></div>
+    <audio id="audio" controls></audio>
+    <div class="vol"><span id="volIcon">🔊</span><input id="vol" type="range" min="0" max="1" step="0.01" value="0.8"></div>
+    <div class="row">
+      <button id="prev">⏮ Назад</button>
+      <button id="like">♡ Лайк</button>
+      <button id="dl">⬇ Зберегти</button>
+      <button id="next">Далі ⏭</button>
+    </div>
+  </div>
+
+  <h2 id="found">Знайдено: 0</h2>
+  <ul id="queue" class="lst"></ul>
+
+  <h2>Збережене ❤</h2>
+  <ul id="list"></ul>
+
+<script>
+const REPO = "https://huggingface.co/datasets/ai-music/ai-music-deduplicated/";
+const SOURCES = ["suno", "udio", "riffusion", "mureka", "sonauto"];
+const CHUNK = 4 * 1024 * 1024;          // скільки читаємо за раз, шукаючи початок наступного треку в tar
+const LIKES_KEY = "genmus.likes.v2";
+const $ = id => document.getElementById(id);
+const audio = $("audio");
+const dec = new TextDecoder();
+
+let mode = "all", current = null, token = 0, objUrl = null;
+
+const loadLikes = () => { try { return JSON.parse(localStorage.getItem(LIKES_KEY)) || [] } catch { return [] } };
+const saveLikes = v => { try { localStorage.setItem(LIKES_KEY, JSON.stringify(v)) } catch {} };
+
+// ---------- читання tar-файлів датасету через Range-запити ----------
+// Офіційний ліміт HF для анонімів: 3000 resolve-запитів / 5 хв на IP (фіксоване вікно).
+// Тримаємо власну стелю 2400 / 5 хв (~80%), щоб не ловити 429; якщо все ж прилетить 429 — спільна пауза.
+const BUDGET = 2400, WINDOW = 300_000;
+const stamps = [];
+let pausedUntil = 0;
+async function throttle() {
+  for (;;) {
+    const now = Date.now();
+    while (stamps.length && stamps[0] < now - WINDOW) stamps.shift();
+    const wait = Math.max(pausedUntil - now, stamps.length >= BUDGET ? stamps[0] + WINDOW - now : 0);
+    if (wait <= 0) { stamps.push(now); return; }
+    $("found").title = "Близько до ліміту Hugging Face — коротка пауза";
+    await new Promise(r => setTimeout(r, Math.min(wait, 2000)));
+  }
+}
+async function range(path, a, b) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await throttle();
+    const r = await fetch(REPO + "resolve/main/" + path, { headers: { Range: `bytes=${a}-${b}` } });
+    if (r.status === 429) { pausedUntil = Date.now() + 20_000 * (attempt + 1); continue; }
+    if (!r.ok && r.status !== 206) throw new Error("HTTP " + r.status);
+    return new Uint8Array(await r.arrayBuffer());
+  }
+  throw new Error("rate limited");
+}
+
+let filesCache = null;
+async function listFiles() {
+  if (filesCache) return filesCache;
+  const parts = await Promise.all(SOURCES.map(async s => {
+    const r = await fetch(`https://huggingface.co/api/datasets/ai-music/ai-music-deduplicated/tree/main/${s}`);
+    return (await r.json()).filter(f => f.path.endsWith(".tar")).map(f => ({ path: f.path, size: f.size, source: s }));
+  }));
+  return (filesCache = parts.flat());
+}
+
+async function pickFile(sources) {
+  const files = (await listFiles()).filter(f => sources.includes(f.source));
+  let x = Math.random() * files.reduce((s, f) => s + f.size, 0);
+  for (const f of files) { if ((x -= f.size) < 0) return f; }
+  return files[files.length - 1];
+}
+
+const oct = (b, a, z) => parseInt(dec.decode(b.subarray(a, z)).replace(/\0.*$/, "").trim() || "0", 8);
+const name = (b, i) => dec.decode(b.subarray(i, i + 100)).replace(/\0.*$/, "");
+const isUstar = (b, i) => b[i+257]===117 && b[i+258]===115 && b[i+259]===116 && b[i+260]===97 && b[i+261]===114;
+
+// з випадкового місця у tar шукаємо заголовок найближчого аудіофайлу
+async function findAudio(file) {
+  let pos = Math.floor(Math.random() * Math.max(1, (file.size - 2 * CHUNK) / 512)) * 512;
+  for (let k = 0; k < 4 && pos < file.size; k++, pos += CHUNK) {
+    const buf = await range(file.path, pos, Math.min(pos + CHUNK, file.size) - 1);
+    for (let i = 0; i + 512 <= buf.length; i += 512) {
+      if (!isUstar(buf, i)) continue;
+      const n = name(buf, i);
+      const m = n.match(/\.(mp3|m4a|ogg)$/);
+      if (m) return { path: file.path, source: file.source, pos: pos + i, size: oct(buf, i + 124, i + 136), ext: m[1] };
+    }
+  }
+  return null;
+}
+
+// після аудіо в tar іде json з метаданими, а за ним — заголовок наступного треку (між ними може бути PaxHeader)
+async function readMetaAndNext(t) {
+  const start = t.pos + 512 + Math.ceil(t.size / 512) * 512;
+  let want = 24 * 1024;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const buf = await range(t.path, start, start + want - 1);
+    let o = 0, meta = null, next = null, grow = false;
+    while (o + 512 <= buf.length) {
+      const n = name(buf, o), sz = oct(buf, o + 124, o + 136);
+      if (!n) break;
+      if (n.endsWith(".json")) {
+        if (o + 512 + sz > buf.length) { want = o + 512 + sz + 2048; grow = true; break; }
+        try { meta = JSON.parse(dec.decode(buf.subarray(o + 512, o + 512 + sz))); } catch { meta = {}; }
+      } else {
+        const m = n.match(/\.(mp3|m4a|ogg)$/);
+        if (m) { next = { path: t.path, source: t.source, pos: start + o, size: sz, ext: m[1] }; break; }
+      }
+      o += 512 + Math.ceil(sz / 512) * 512;
+    }
+    if (!grow) return { meta: meta || {}, next };
+  }
+  return { meta: {}, next: null };
+}
+
+// ---------- нормалізація метаданих різних платформ ----------
+const asList = v => Array.isArray(v) ? v : (typeof v === "string" ? v.split(",") : []);
+const hasLyrics = txt => {
+  const t = String(txt || "").replace(/\[[^\]]*\]/g, "").replace(/\(.*?\)/g, "").trim();
+  return t.length > 0;
+};
+function normalize(m, source) {
+  let tags = [], lyrics = null, vocals = null;
+  if (source === "suno") {
+    const md = m.metadata || {};
+    tags = asList(md.tags); lyrics = md.prompt || "";
+    vocals = hasLyrics(lyrics);
+  } else if (source === "udio") {
+    tags = asList(m.tags); lyrics = m.lyrics || "";
+    vocals = hasLyrics(lyrics);
+  } else if (source === "riffusion") {
+    tags = asList(m.sound); lyrics = m.lyrics || "";
+    vocals = hasLyrics(lyrics);
+  } else if (source === "sonauto") {
+    tags = asList(m.tags);
+    if (tags.some(t => /instrumental/i.test(t))) vocals = false;
+    else if (m.lyrics_id) vocals = true;
+  } else if (source === "mureka") {
+    tags = [...asList(m.genres), ...asList(m.moods)];
+  }
+  tags = tags.map(s => String(s).trim()).filter(Boolean);
+  const title = (m.title || "Без назви").trim();
+  return { title, tags, vocals, haystack: [title, tags.join(" "), lyrics || "", m.description || ""].join(" ").toLowerCase() };
+}
+
+const matches = (n, term) => {
+  if (mode === "vocal" && n.vocals !== true) return false;
+  if (mode === "instr" && n.vocals !== false) return false;
+  return !term || term.split(/\s+/).every(w => n.haystack.includes(w));
+};
+
+// ---------- вибір треку ----------
+// одне випадкове місце в tar → кілька сусідніх треків з метаданими (дешево: по одному маленькому запиту на трек)
+const RUN = 5;
+async function probeRun(sources) {
+  const out = [];
+  let t = await findAudio(await pickFile(sources));
+  for (let i = 0; i < RUN && t; i++) {
+    let r;
+    try { r = await readMetaAndNext(t); } catch { break; }
+    out.push({ ...t, ...normalize(r.meta, t.source) });
+    t = r.next;
+  }
+  return out;
+}
+
+// ---------- фонова черга: пошук іде постійно, знайдене складається в чергу ----------
+const WORKERS = 6;
+let fallbackUsed = false, queue = [], gen = 0, scanned = 0, curTerm = "", curSources = SOURCES;
+const pool = [];   // усі переглянуті треки (навіть ті, що не підійшли під фільтр) — запасний варіант для «Далі»
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function resetQueue() {
+  gen++; queue = []; scanned = 0;
+  curTerm = $("q").value.trim().toLowerCase();
+  // у Mureka немає ні текстів, ні ознаки «інструментал» — їх пропускаємо при фільтрі
+  curSources = mode !== "all" ? SOURCES.filter(s => s !== "mureka") : SOURCES;
+  renderQueue();
+  for (let i = 0; i < WORKERS; i++) worker(gen);
+}
+
+async function worker(g) {
+  const filtered = mode !== "all" || curTerm;
+  const target = filtered ? 10 : 3;
+  while (g === gen) {
+    if (queue.length >= target) { await sleep(500); continue; }
+    const list = await probeRun(curSources).catch(() => []);
+    if (g !== gen) return;
+    for (const t of list) {
+      scanned++;
+      pool.push(t); if (pool.length > 300) pool.shift();
+      if (matches(t, curTerm) && !queue.some(x => same(x, t)) && !(current && same(current, t))) queue.push(t);
+    }
+    renderQueue();
+  }
+}
+
+// якщо черга порожня — не чекаємо, а граємо будь-який відомий трек (лайки, історія, переглянуте), перевагу мають ті, що підходять під фільтр
+function fallbackTrack() {
+  const known = [...loadLikes(), ...history, ...pool].filter(x => !(current && same(x, current)));
+  if (!known.length) return null;
+  const fit = known.filter(x => matches(x, curTerm));
+  const src = fit.length ? fit : known;
+  return src[Math.floor(Math.random() * src.length)];
+}
+
+async function takeNext(my) {
+  while (my === token) {
+    if (queue.length) { const t = queue.shift(); renderQueue(); return t; }
+    const f = fallbackTrack();
+    if (f) { fallbackUsed = true; return f; }
+    $("status").textContent = `Чекаю на перший збіг… переглянуто ${scanned}`;
+    await sleep(300);
+  }
+  return undefined;
+}
+
+function renderQueue() {
+  $("found").textContent = `Знайдено: ${queue.length} · переглянуто ${scanned}`;
+  const ul = $("queue");
+  ul.innerHTML = queue.length ? "" : '<li class="empty">Шукаю…</li>';
+  queue.forEach(t => {
+    const li = document.createElement("li");
+    li.innerHTML = `<span></span><button>▶</button>`;
+    li.firstChild.textContent = t.title + (t.tags.length ? " — " + t.tags.slice(0, 2).join(", ") : "");
+    li.querySelector("button").onclick = () => { queue = queue.filter(x => x !== t); renderQueue(); next(t); };
+    ul.appendChild(li);
+  });
+}
+
+// ---------- відтворення ----------
+const MIME = { mp3: "audio/mpeg", m4a: "audio/mp4", ogg: "audio/ogg" };
+const label = v => v === true ? "🎤 зі словами" : v === false ? "🎹 без слів" : "слова: невідомо";
+
+const HIST_KEY = "genmus.history";
+let history = [];   // вже програні треки (без аудіо), щоб можна було повернутися назад; переживає перезавантаження
+try { history = JSON.parse(localStorage.getItem(HIST_KEY)) || []; } catch {}
+function saveHistory() { try { localStorage.setItem(HIST_KEY, JSON.stringify(history)) } catch {} }
+function updatePrev() { saveHistory(); }
+
+async function show(t, my, back) {
+  $("status").textContent = "Завантажую трек…";
+  const bytes = await range(t.path, t.pos + 512, t.pos + 511 + t.size);
+  if (my !== token) return;
+  const blob = new Blob([bytes], { type: MIME[t.ext] });
+  if (objUrl) URL.revokeObjectURL(objUrl);
+  objUrl = URL.createObjectURL(blob);
+  if (current && !back) { const { blob: _b, ...meta } = current; history.push(meta); if (history.length > 50) history.shift(); }
+  current = { ...t, blob };
+  updatePrev();
+  audio.src = objUrl;
+  $("title").textContent = t.title;
+  $("tags").textContent = t.tags.slice(0, 6).join(" · ");
+  $("status").textContent = `${t.source} · ${label(t.vocals)}` + (fallbackUsed ? " · з уже відомих (новий пошук триває)" : "");
+  fallbackUsed = false;
+  updateLike();
+  audio.play().catch(() => { $("status").textContent += " · натисни ▶" });
+}
+
+async function next(fixed, back) {
+  const my = ++token;
+  $("disc").classList.remove("spin");
+  $("status").textContent = "Шукаю трек…";
+  try {
+    const t = fixed || await takeNext(my);
+    if (my !== token || t === undefined) return;
+    await show(t, my, back);
+  } catch (e) {
+    if (my === token) $("status").textContent = "Помилка завантаження. Натисни «Далі».";
+  }
+}
+
+// ---------- лайки ----------
+const same = (a, b) => a.path === b.path && a.pos === b.pos;
+function updateLike() {
+  const on = current && loadLikes().some(x => same(x, current));
+  $("like").classList.toggle("on", !!on);
+  $("like").textContent = on ? "♥ Збережено" : "♡ Лайк";
+}
+function render() {
+  const likes = loadLikes(), ul = $("list");
+  ul.innerHTML = likes.length ? "" : '<li class="empty">Поки порожньо — лайкни щось.</li>';
+  likes.forEach(x => {
+    const li = document.createElement("li");
+    li.innerHTML = `<span></span><button>▶</button><button>✕</button>`;
+    li.firstChild.textContent = x.title;
+    const [p, d] = li.querySelectorAll("button");
+    p.onclick = () => next(x);
+    d.onclick = () => { saveLikes(loadLikes().filter(y => !same(y, x))); render(); updateLike(); };
+    ul.appendChild(li);
+  });
+}
+$("like").onclick = () => {
+  if (!current) return;
+  const likes = loadLikes(), i = likes.findIndex(x => same(x, current));
+  if (i >= 0) likes.splice(i, 1);
+  else { const { path, source, pos, size, ext, title, tags, vocals } = current; likes.unshift({ path, source, pos, size, ext, title, tags, vocals }); }
+  saveLikes(likes); render(); updateLike();
+};
+
+// ---------- збереження файлу ----------
+$("dl").onclick = () => {
+  if (!current) return;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(current.blob);
+  a.download = current.title.replace(/[^\p{L}\p{N} _-]+/gu, "").trim().slice(0, 80) + "." + current.ext;
+  a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
+
+// ---------- керування ----------
+$("seg").onclick = e => {
+  const m = e.target.dataset.m; if (!m) return;
+  mode = m;
+  document.querySelectorAll("#seg button").forEach(b => b.classList.toggle("on", b.dataset.m === m));
+  resetQueue(); next();
+};
+$("q").onkeydown = e => { if (e.key === "Enter") { resetQueue(); next(); } };
+$("next").onclick = () => next();
+// як у звичайних плеєрах: якщо трек грає вже кілька секунд або історія порожня — починаємо його спочатку, інакше йдемо до попереднього
+$("prev").onclick = () => {
+  if (history.length && !(current && audio.currentTime > 3)) { next(history.pop(), true); updatePrev(); }
+  else if (current) { audio.currentTime = 0; audio.play().catch(() => {}); }
+};
+audio.onplay = () => $("disc").classList.add("spin");
+audio.onpause = () => $("disc").classList.remove("spin");
+audio.onended = () => next();
+
+// ---------- гучність ----------
+const VOL_KEY = "genmus.volume";
+function setVol(v) {
+  audio.volume = v; $("vol").value = v;
+  $("volIcon").textContent = v == 0 ? "🔇" : v < 0.4 ? "🔉" : "🔊";
+  try { localStorage.setItem(VOL_KEY, v) } catch {}
+}
+$("vol").oninput = () => setVol(+$("vol").value);
+$("volIcon").onclick = () => setVol(audio.volume > 0 ? 0 : 0.8);
+let v0 = 0.8; try { v0 = parseFloat(localStorage.getItem(VOL_KEY)); if (isNaN(v0)) v0 = 0.8 } catch {}
+setVol(v0);
+
+render();
+resetQueue();
+next();
+</script>
+</body>
+</html>
