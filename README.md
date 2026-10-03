@@ -41,7 +41,7 @@ The Hugging Face datasets-server only exposes the first 1,200 rows, so the page 
 A multilingual sentence-embedding model ([paraphrase-multilingual-MiniLM-L12-v2](https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2), int8, ~118 MB, downloaded once and cached by the browser)
 runs in the page via [transformers.js](https://huggingface.co/docs/transformers.js). It starts loading when the search box gets focus.
 
-- Each scanned track is embedded from its title, tags, description and the start of its lyrics; the query (or the current track for *Similar*) is embedded too, and relevance is cosine similarity (+0.1 if all query words also appear literally).
+- Each scanned track gets two embeddings: **style** (genre tags + description) and **text** (title + start of the lyrics). Relevance = 0.7 × style similarity + 0.3 × text similarity (cosine), so the genre matters more than the lyrics; +0.1 if all query words also appear literally. A text query is compared with both parts; *Similar* compares style with style and text with text.
 - The dataset can't be indexed up front, so the search samples it: a track is queued if it scores at least 0.4 **and** is in the top 20% of everything scanned for this query. The first 120 tracks are always scanned, and the queue keeps the 15 best, sorted.
 - If the model fails to load, search falls back to exact word matching.
 

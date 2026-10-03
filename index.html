@@ -267,10 +267,11 @@ function normalize(m, source) {
   }
   tags = tags.map(s => String(s).trim()).filter(Boolean);
   const title = (m.title || t("noTitle")).trim();
-  // для моделі: назва, теги, опис і початок тексту без службових [Verse]/[Chorus]
+  // для моделі окремо: стиль (жанр/теги/опис) і текст (назва + початок слів без службових [Verse]/[Chorus])
   const words = String(lyrics || "").replace(/\[[^\]]*\]/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
-  const doc = [title, tags.join(", "), m.description || "", words].filter(Boolean).join(". ");
-  return { title, tags, vocals, doc, haystack: [title, tags.join(" "), lyrics || "", m.description || ""].join(" ").toLowerCase() };
+  const style = [tags.join(", "), m.description || ""].filter(Boolean).join(". ");
+  const text = [title, words].filter(Boolean).join(". ");
+  return { title, tags, vocals, style, text, haystack: [title, tags.join(" "), lyrics || "", m.description || ""].join(" ").toLowerCase() };
 }
 
 // ---------- смисловий (semantic) пошук ----------
@@ -278,6 +279,7 @@ function normalize(m, source) {
 // перетворюються на вектори, схожість = косинус. Українські запити знаходять англійські теги й навпаки.
 const MODEL = "Xenova/paraphrase-multilingual-MiniLM-L12-v2";
 const MIN_SIM = 0.4;      // нижче цього — вже не про те
+const STYLE_W = 0.7;      // жанр/теги важать більше, ніж назва й текст пісні
 const TOP_SHARE = 0.2;    // і серед переглянутих беремо лише найкращі ~20%
 const MIN_SCAN = 120;     // при смисловому пошуку не зупиняємось на перших збігах — є з чого вибрати найкращі
 const KEEP = 15;          // скільки найкращих кандидатів тримаємо в черзі
@@ -305,12 +307,26 @@ async function embed(texts) {
   const p = await loadModel();
   return p ? (await p(texts, { pooling: "mean", normalize: true })).tolist() : null;
 }
-const docOf = n => n.doc || [n.title, (n.tags || []).join(", ")].join(". ");
+const styleOf = n => n.style ?? (n.tags || []).join(", ");
+const textOf = n => n.text ?? n.title;
+// два вектори на трек: { s: стиль (null, якщо тегів нема), t: назва + текст }
+async function embedPairs(list) {
+  const texts = list.flatMap(n => [styleOf(n), textOf(n)].filter(Boolean));
+  const v = await embed(texts);
+  if (!v) return null;
+  let i = 0;
+  return list.map(n => ({ s: styleOf(n) ? v[i++] : null, t: textOf(n) ? v[i++] : null }));
+}
 async function embedTracks(list) {
   const need = list.filter(x => !x.emb);
   if (!need.length) return;
-  const v = await embed(need.map(docOf));
+  const v = await embedPairs(need);
   if (v) need.forEach((x, i) => x.emb = v[i]);
+}
+// стиль зі стилем, текст із текстом; якщо однієї частини нема — рахуємо за іншою
+function sim(q, e) {
+  const s = q.s && e.s ? dot(q.s, e.s) : null, t = q.t && e.t ? dot(q.t, e.t) : null;
+  return s === null ? (t ?? 0) : t === null ? s : STYLE_W * s + (1 - STYLE_W) * t;
 }
 const dot = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
 
@@ -320,7 +336,7 @@ const keywordHit = n => !!curTerm && curTerm.split(/\s+/).every(w => (n.haystack
 function relevance(n) {
   if (!passesMode(n)) return null;
   if (!curTerm && !simTo) return 1;
-  if (qvec && n.emb) return dot(qvec, n.emb) + (keywordHit(n) ? 0.1 : 0);   // точний збіг слів — невеликий бонус
+  if (qvec && n.emb) return sim(qvec, n.emb) + (keywordHit(n) ? 0.1 : 0);   // точний збіг слів — невеликий бонус
   if (qvec || !curTerm) return null;     // вектора треку ще нема / «схожі» без моделі
   return keywordHit(n) ? 1 : null;       // модель недоступна — старий пошук за словами
 }
@@ -363,7 +379,9 @@ function resetQueue(similar) {
   // вектор запиту: текст із поля або сам трек («Схожі»)
   qReady = !curTerm && !simTo ? Promise.resolve()
     : simTo && simTo.emb ? Promise.resolve(qvec = simTo.emb)
-    : embed([simTo ? docOf(simTo) : curTerm]).then(v => { if (g === gen && v) qvec = v[0]; }).catch(() => {});
+    : (simTo ? embedPairs([simTo]).then(v => v && v[0])
+       : embed([curTerm]).then(v => v && { s: v[0], t: v[0] }))   // текстовий запит порівнюємо і зі стилем, і з текстом
+      .then(q => { if (g === gen && q) qvec = q; }).catch(() => {});
   // у Mureka немає ні текстів, ні ознаки «інструментал» — їх пропускаємо при фільтрі
   curSources = mode !== "all" ? SOURCES.filter(s => s !== "mureka") : SOURCES;
   renderQueue();
@@ -405,14 +423,14 @@ function fallbackTrack(onlyFit) {
 }
 
 async function takeNext(my) {
-  if (queue.length === 0) { setStatus("waiting", scanned); await qReady; }   // модель може ще вантажитись — таймер чекання від моменту, коли запит готовий
-  const start = Date.now();
-  const filtered = mode !== "all" || curTerm || simTo;
   while (my === token) {
     if (queue.length) { const t = queue.shift(); renderQueue(); return t; }
-    // з активним пошуком чекаємо на знайдене; випадковий трек — лише якщо пошуку нема або він довго нічого не знаходить
-    const f = fallbackTrack(filtered && Date.now() - start < 15000);
+    // черга порожня — «Далі» не чекає на пошук: найближчий з відомих, інакше будь-який відомий, інакше свіжий випадковий
+    const f = fallbackTrack(false);
     if (f) { fallbackUsed = true; return f; }
+    const [r] = await probeRun(SOURCES).catch(() => []);
+    if (my !== token) return undefined;
+    if (r) { fallbackUsed = true; return r; }
     setStatus("waiting", scanned);
     await sleep(300);
   }
