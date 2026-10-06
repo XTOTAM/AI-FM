@@ -135,6 +135,23 @@ function cacheRecord(t) {
   const { path, source, pos, size, ext, title, tags, vocals, style, text, haystack, emb } = t;
   return { key: trackKey(t), path, source, pos, size, ext, title, tags, vocals, style, text, haystack, emb: emb || null, at: Date.now() };
 }
+async function cacheCount() {
+  try {
+    const db = await openCache();
+    return await new Promise((resolve, reject) => {
+      const r = db.transaction(CACHE_STORE, "readonly").objectStore(CACHE_STORE).count();
+      r.onsuccess = () => resolve(r.result);
+      r.onerror = () => reject(r.error);
+    });
+  } catch (e) { console.warn("track cache:", e); return known; }
+}
+function setKnown(n) {
+  known = n | 0;
+  renderQueue();
+}
+async function refreshKnown() {
+  setKnown(await cacheCount());
+}
 async function cachePut(list) {
   if (!list?.length) return;
   try {
@@ -146,21 +163,20 @@ async function cachePut(list) {
       tx.oncomplete = resolve;
       tx.onerror = () => reject(tx.error);
     });
-    const n = await new Promise((resolve, reject) => {
-      const r = db.transaction(CACHE_STORE, "readonly").objectStore(CACHE_STORE).count();
-      r.onsuccess = () => resolve(r.result);
-      r.onerror = () => reject(r.error);
-    });
-    if (n <= CACHE_MAX) return;
-    const all = await cacheList();
-    const drop = all.sort((a, b) => (a.at || 0) - (b.at || 0)).slice(0, all.length - CACHE_MAX);
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction(CACHE_STORE, "readwrite");
-      const st = tx.objectStore(CACHE_STORE);
-      for (const t of drop) st.delete(t.key);
-      tx.oncomplete = resolve;
-      tx.onerror = () => reject(tx.error);
-    });
+    let n = await cacheCount();
+    if (n > CACHE_MAX) {
+      const all = await cacheList();
+      const drop = all.sort((a, b) => (a.at || 0) - (b.at || 0)).slice(0, all.length - CACHE_MAX);
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(CACHE_STORE, "readwrite");
+        const st = tx.objectStore(CACHE_STORE);
+        for (const t of drop) st.delete(t.key);
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+      });
+      n = await cacheCount();
+    }
+    setKnown(n);
   } catch (e) { console.warn("track cache:", e); }
 }
 async function cacheList() {
@@ -174,6 +190,7 @@ async function cacheList() {
     });
   } catch (e) { console.warn("track cache:", e); return []; }
 }
+let known = 0;
 
 // ---------- i18n (English by default, switchable) ----------
 const I = {
@@ -187,8 +204,11 @@ const I = {
     prev: "⏮ Back", like: "♡ Like", liked: "♥ Saved", dl: "⬇ Save", next: "Next ⏭",
     sub: "Every track made by AI. Press next. Keep what you love.",
     saved: "Saved ❤", savedEmpty: "Nothing yet — like something.",
-    found: (n, m) => `Found: ${n} · scanned ${m}`, searchingLi: "Searching…",
+    found: (n, m, k) => `Found: ${n} · scanned ${m} · catalog ${k}/${CACHE_MAX}`, searchingLi: "Searching…",
     waiting: m => `Waiting for the first match… scanned ${m}`,
+    searchProg: (q, n, m) => n
+      ? `Searching “${q}”… ${n} in queue · scanned ${m}`
+      : `Searching “${q}”… scanned ${m}`,
     searching: "Looking for a track…", loading: "Loading track…",
     error: "Loading failed. Press “Next”.",
     track: (src, v, fb, hint, pct) => `${src} · ${v === true ? "🎤 with vocals" : v === false ? "🎹 instrumental" : "vocals: unknown"}` + (pct != null ? ` · ${pct}% match` : "") + (fb ? " · from already known (search continues)" : "") + (hint ? " · press ▶" : ""),
@@ -206,8 +226,11 @@ const I = {
     prev: "⏮ Назад", like: "♡ Лайк", liked: "♥ Збережено", dl: "⬇ Зберегти", next: "Далі ⏭",
     sub: "Кожен трек створений ШІ. Тисни «Далі». Лишай, що сподобалось.",
     saved: "Збережене ❤", savedEmpty: "Поки порожньо — лайкни щось.",
-    found: (n, m) => `Знайдено: ${n} · переглянуто ${m}`, searchingLi: "Шукаю…",
+    found: (n, m, k) => `Знайдено: ${n} · переглянуто ${m} · каталог ${k}/${CACHE_MAX}`, searchingLi: "Шукаю…",
     waiting: m => `Чекаю на перший збіг… переглянуто ${m}`,
+    searchProg: (q, n, m) => n
+      ? `Шукаю «${q}»… у черзі ${n} · переглянуто ${m}`
+      : `Шукаю «${q}»… переглянуто ${m}`,
     searching: "Шукаю трек…", loading: "Завантажую трек…",
     error: "Помилка завантаження. Натисни «Далі».",
     track: (src, v, fb, hint, pct) => `${src} · ${v === true ? "🎤 зі словами" : v === false ? "🎹 без слів" : "слова: невідомо"}` + (pct != null ? ` · збіг ${pct}%` : "") + (fb ? " · з уже відомих (новий пошук триває)" : "") + (hint ? " · натисни ▶" : ""),
@@ -273,7 +296,8 @@ async function listFiles() {
   if (!filesPending) {
     filesPending = Promise.all(SOURCES.map(async s => {
       const r = await fetch(`https://huggingface.co/api/datasets/ai-music/ai-music-deduplicated/tree/main/${s}`);
-      return (await r.json()).filter(f => f.path.endsWith(".tar")).map(f => ({ path: f.path, size: f.size, source: s }));
+      const data = await r.json();
+      return (Array.isArray(data) ? data : []).filter(f => f.path?.endsWith(".tar")).map(f => ({ path: f.path, size: f.size, source: s }));
     })).then(parts => (filesCache = parts.flat()))
       .finally(() => { filesPending = null; });
   }
@@ -292,9 +316,10 @@ const name = (b, i) => dec.decode(b.subarray(i, i + 100)).replace(/\0.*$/, "");
 const isUstar = (b, i) => b[i+257]===117 && b[i+258]===115 && b[i+259]===116 && b[i+260]===97 && b[i+261]===114;
 
 // з випадкового місця у tar шукаємо заголовок найближчого аудіофайлу
-async function findAudio(file) {
+async function findAudio(file, g) {
   let pos = Math.floor(Math.random() * Math.max(1, (file.size - 2 * CHUNK) / 512)) * 512;
   for (let k = 0; k < 4 && pos < file.size; k++, pos += CHUNK) {
+    if (g != null && g !== gen) return null;
     const buf = await range(file.path, pos, Math.min(pos + CHUNK, file.size) - 1);
     for (let i = 0; i + 512 <= buf.length; i += 512) {
       if (!isUstar(buf, i)) continue;
@@ -369,8 +394,8 @@ function normalize(m, source) {
 // перетворюються на вектори, схожість = косинус. Українські запити знаходять англійські теги й навпаки.
 const MODEL = "Xenova/paraphrase-multilingual-MiniLM-L12-v2";
 const MIN_SIM = 0.3;      // нижче цього — вже не про те (основний відбір — відносний, див. TOP_SHARE)
-const SOFT_MIN = 0.2;     // м'якша підлога, поки черга порожня після довгого скану
-const SOFT_AFTER = 100;   // після стількох переглядів без збігів — допускаємо SOFT_MIN
+const SOFT_MIN = 0.2;     // м'якша підлога, поки черга порожня після короткого скану
+const SOFT_AFTER = 15;    // після стількох переглядів без збігів — допускаємо SOFT_MIN (було 100; кеш теж рахується)
 const STYLE_W = 0.7;      // жанр/теги важать більше, ніж назва й текст пісні
 const TOP_SHARE = 0.2;    // і серед переглянутих беремо лише найкращі ~20%
 const MIN_QUEUE = 5;      // завжди тримаємо мінімум стільки знайдених наступних
@@ -486,35 +511,96 @@ function sim(q, e) {
 const dot = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
 
 const passesMode = n => !(mode === "vocal" && n.vocals !== true) && !(mode === "instr" && n.vocals !== false);
-const keywordHit = n => !!curTerm && curTerm.split(/\s+/).every(w => (n.haystack || n.title.toLowerCase()).includes(w));
+// гео/мовні запити: датасет тегає англійською (italian/german/latin…), а модель плутає «італіана»↔latin
+const LOCALE_Q = {
+  італіана: { embed: "italian music italy italiano canzone napoli", kw: ["italian", "italy", "italiano", "italiana", "canzone", "італ"] },
+  італія: { embed: "italian music italy italiano canzone", kw: ["italian", "italy", "italiano", "італ"] },
+  італійська: { embed: "italian music italy italiano canzone", kw: ["italian", "italy", "italiano", "італ"] },
+  italian: { embed: "italian music italy italiano canzone", kw: ["italian", "italy", "italiano", "italiana", "canzone"] },
+  italiana: { embed: "italian music italy italiano canzone", kw: ["italian", "italy", "italiano", "italiana", "canzone"] },
+  italy: { embed: "italian music italy italiano", kw: ["italian", "italy", "italiano"] },
+  // «Дерман» — типове фонетичне German
+  // berlin навмисно не в kw: тег «berlin school» (жанр) дає хибні збіги без німецької
+  дерман: { embed: "german music germany deutsch schlager oktoberfest", kw: ["german", "germany", "deutsch", "deutsche", "deutschland", "schlager"] },
+  german: { embed: "german music germany deutsch schlager oktoberfest", kw: ["german", "germany", "deutsch", "deutsche", "deutschland", "schlager"] },
+  germany: { embed: "german music germany deutsch", kw: ["german", "germany", "deutsch", "deutschland"] },
+  deutsch: { embed: "german music germany deutsch", kw: ["german", "germany", "deutsch", "deutsche", "deutschland"] },
+  німеччина: { embed: "german music germany deutsch", kw: ["german", "germany", "deutsch", "deutschland", "німеч"] },
+  німецька: { embed: "german music germany deutsch", kw: ["german", "germany", "deutsch", "deutschland", "німец"] },
+  ukraine: { embed: "ukraine ukrainian kyiv", kw: ["ukraine", "ukrainian", "україн", "украин", "україна", "kyiv", "kiev", "київ"] },
+  україн: { embed: "ukraine ukrainian kyiv", kw: ["ukraine", "ukrainian", "україн", "україна", "kyiv", "київ"] },
+  ukrainian: { embed: "ukraine ukrainian kyiv", kw: ["ukraine", "ukrainian", "україн", "україна"] },
+};
+const localeOf = term => LOCALE_Q[(term || "").trim().toLowerCase()] || null;
+const embedTerm = term => { const x = localeOf(term); return x ? `${term} ${x.embed}` : term; };
+const kwIn = (hay, a) => /^[a-z]+$/i.test(a) ? new RegExp(`\\b${a}\\b`, "i").test(hay) : hay.includes(a);
+const keywordHit = n => {
+  if (!curTerm) return false;
+  const hay = n.haystack || n.title.toLowerCase();
+  const loc = localeOf(curTerm);
+  if (loc) return loc.kw.some(a => kwIn(hay, a)) || hay.includes(curTerm);
+  return curTerm.split(/\s+/).every(w => {
+    const x = localeOf(w);
+    return hay.includes(w) || (x && x.kw.some(a => kwIn(hay, a)));
+  });
+};
+// «італіана» семантично чіпляється за тег latin — без italian-маркерів ріжемо начисто
+function localeBlocked(n) {
+  const loc = localeOf(curTerm);
+  if (!loc || keywordHit(n)) return false;
+  const hay = n.haystack || n.title.toLowerCase();
+  if (loc.embed.includes("italian") && /\blatin\b/.test(hay) && !/\b(italian|italy|italiano|canzone)\b/.test(hay)) return true;
+  return false;
+}
+function localePenalty(n) {
+  return localeBlocked(n) ? 1 : 0;   // relevance піде нижче будь-якого порогу
+}
 // релевантність: null — не підходить; без запиту — 1
 function relevance(n) {
   if (!passesMode(n)) return null;
   if (!curTerm && !simTo) return 1;
-  if (qvec && n.emb) return sim(qvec, n.emb) + (keywordHit(n) ? 0.1 : 0);   // точний збіг слів — невеликий бонус
+  if (qvec && n.emb) return sim(qvec, n.emb) + (keywordHit(n) ? 0.15 : 0) - localePenalty(n);
   if (qvec || !curTerm) return null;     // вектора треку ще нема / «схожі» без моделі
   return keywordHit(n) ? 1 : null;       // модель недоступна — старий пошук за словами
 }
+// для italian/german тощо: спочатку лише keyword; без нього — дуже високий semantic
+const LOCALE_STRICT = 0.55;
+const LOCALE_SCAN_CAP = 200;   // скільки HF-треків шукаємо keyword, навіть якщо черга вже повна сміттям
 // поріг адаптивний: не нижче підлоги і не гірше за топ-20% усього переглянутого в цьому пошуку;
-// поки черга порожня після SOFT_AFTER — підлога м'якша, щоб з сотень сканів хоч щось потрапило
+// порожня черга: м'якша підлога після SOFT_AFTER (scanned АБО considered — кеш теж рахується)
 function threshold() {
   // радіо (нема запиту) — поріг не потрібен; без qvec семантичний скоринг ще не готовий
   if (!curTerm && !simTo) return 0;
   if (!qvec) return 1;
-  const floor = (!queue.length && scanned >= SOFT_AFTER) ? SOFT_MIN : MIN_SIM;
+  const loc = localeOf(curTerm);
+  // locale: не розм'якшуємо до SOFT_MIN — soft забивав чергу kawaii/latin замість german/italian
+  if (loc) {
+    if (seen.length < 20) return LOCALE_STRICT;
+    const s = [...seen].sort((a, b) => b - a);
+    return Math.max(LOCALE_STRICT, s[Math.floor(s.length * TOP_SHARE)]);
+  }
+  const explored = Math.max(scanned, considered, seen.length);
+  const empty = !queue.length;
+  const floor = (empty && explored >= SOFT_AFTER) ? SOFT_MIN : MIN_SIM;
   if (seen.length < 20) return floor;
   const s = [...seen].sort((a, b) => b - a);
-  return Math.max(floor, s[Math.floor(s.length * TOP_SHARE)]);
+  const relative = s[Math.floor(s.length * TOP_SHARE)];
+  // порожня черга: тримаємо відносний топ від SOFT_MIN, інакше рідкі запити вічно з Found: 0
+  if (empty) return Math.max(SOFT_MIN, relative);
+  return Math.max(floor, relative);
 }
 const pctOf = n => qvec && n.score != null ? Math.round(Math.min(1, n.score) * 100) : null;
 
 // ---------- вибір треку ----------
 // одне випадкове місце в tar → кілька сусідніх треків з метаданими (дешево: по одному маленькому запиту на трек)
 const RUN = 5;
-async function probeRun(sources) {
+async function probeRun(sources, g) {
   const out = [];
-  let t = await findAudio(await pickFile(sources));
+  const file = await pickFile(sources);
+  if (g != null && g !== gen) return out;
+  let t = await findAudio(file, g);
   for (let i = 0; i < RUN && t; i++) {
+    if (g != null && g !== gen) return out;
     let r;
     try { r = await readMetaAndNext(t); } catch { break; }
     out.push({ ...t, ...normalize(r.meta, t.source), raw: r.meta });
@@ -525,18 +611,35 @@ async function probeRun(sources) {
 
 // ---------- фонова черга: завжди мінімум MIN_QUEUE наступних ----------
 // Probe і embed розведені: Range-скан не чекає на модель — лічильник scanned росте одразу.
-// Один воркер, без пауз, поки Found < MIN_QUEUE. На 5+ — стоп (під час завантаження аудіо теж мовчимо).
+// Радіо: один воркер до MIN_QUEUE. Текстовий/«схожі»: до KEEP, щоб слабкі збіги витіснялись хайкращими.
 const WORKERS_MAX = 1;
 const EMBED_SLOTS = 2;   // скільки батчів одночасно годуємо модель (решта чекає слота, probe крутиться далі)
 let audioBusy = false;   // під час Range аудіо — воркери мовчать, інакше HF-з'єднання забиті й трек «вічно Loading»
 function hungry() {
   if (audioBusy) return false;
-  return queue.length < MIN_QUEUE;
+  if (localeOf(curTerm)) {
+    const kwN = queue.filter(keywordHit).length;
+    // поки мало точних locale-збігів — продовжуємо HF-probe, навіть якщо черга вже чимось заповнена
+    if (kwN < MIN_QUEUE && scanned < LOCALE_SCAN_CAP) return true;
+    return queue.length < KEEP;
+  }
+  const need = (curTerm || simTo) ? KEEP : MIN_QUEUE;
+  return queue.length < need;
 }
 function pace() {
   if (!hungry()) return { slots: 0, delay: 800 };
-  return { slots: 1, delay: 0 };   // однопоточно, нон-стоп до MIN_QUEUE
+  return { slots: 1, delay: 0 };   // однопоточно, нон-стоп до цілі черги
 }
+function showSearchStatus() {
+  if (simTo) { setStatus("searchProg", t("simTo", simTo.title), queue.length, scanned); return; }
+  if (curTerm) { setStatus("searchProg", curTerm, queue.length, scanned); return; }
+}
+// #region agent log
+const _dbg = (hypothesisId, location, message, data = {}) => {
+  fetch('http://127.0.0.1:7838/ingest/ec659e91-a568-410b-a09d-cee7f64a578e',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f54bf4'},body:JSON.stringify({sessionId:'f54bf4',runId:'post-fix2',hypothesisId,location,message,data:{...data,qLen:queue.length,scanned,considered,curTerm,hasQvec:!!qvec,gen,thr: (curTerm&&qvec)?threshold():null,loc:!!localeOf(curTerm),h:hungry()},timestamp:Date.now()})}).catch(()=>{});
+};
+let _dbgAdmitN = 0, _dbgHungryAt = 0;
+// #endregion
 let fallbackUsed = false, queue = [], gen = 0, scanned = 0, considered = 0, curTerm = "", curSources = SOURCES;
 let simTo = null, qvec = null, qReady = Promise.resolve(), seen = [];
 let qTimer = 0, embedInflight = 0;
@@ -567,10 +670,15 @@ function resetQueue(similar) {
   qReady = !curTerm && !simTo ? Promise.resolve()
     : simTo && simTo.emb ? Promise.resolve(qvec = simTo.emb)
     : (simTo ? embedPairs([simTo], g, true).then(v => v && v[0])
-       : embed([curTerm], g, true).then(v => v && { s: v[0], t: v[0], word: v[0] }))   // текстовий запит порівнюємо і зі стилем, і з текстом
+       : embed([embedTerm(curTerm)], g, true).then(v => v && { s: v[0], t: v[0], word: v[0] }))   // текстовий запит (+ locale expand) зі стилем і текстом
       .then(q => { if (g === gen && q) qvec = q; }).catch(() => {});
   // у Mureka немає ні текстів, ні ознаки «інструментал» — їх пропускаємо при фільтрі
   curSources = mode !== "all" ? SOURCES.filter(s => s !== "mureka") : SOURCES;
+  // #region agent log
+  _dbgAdmitN = 0;
+  _dbg('A', 'resetQueue', 'search reset', { g, term: curTerm });
+  // #endregion
+  showSearchStatus();
   renderQueue();
   // кеш завжди: радіо одразу набирає вже відомі треки; запит — семантичний скоринг без нових Range
   rankCached(g);
@@ -603,11 +711,32 @@ function admit(t, s) {
   }
   const thr = threshold();
   if (s < thr) return;
+  const kw = keywordHit(t);
+  if (localeBlocked(t)) {
+    // #region agent log
+    if (_dbgAdmitN < 8) _dbg('C', 'admit:locale-block', 'latin without italian', { s, title: (t.title || '').slice(0, 40), tags: (t.tags || []).slice(0, 4).join(', ') });
+    // #endregion
+    return;
+  }
+  // поки в черзі мало keyword — не забиваємо її «майже italian/german» з кешу
+  if (localeOf(curTerm) && !kw) {
+    const kwN = queue.filter(keywordHit).length;
+    if (kwN < MIN_QUEUE || s < LOCALE_STRICT) {
+      // #region agent log
+      if (_dbgAdmitN < 12) _dbg('C', 'admit:locale-skip', 'wait for kw hits', { s, thr, kwN, title: (t.title || '').slice(0, 40) });
+      // #endregion
+      return;
+    }
+  }
   // якщо топ повний — пускаємо лише кращих за найгірший (інакше кеш із тисяч треків не витіснить слабкі збіги)
   if (queue.length >= KEEP && s <= (queue[queue.length - 1].score ?? 0)) return;
   queue.push({ ...t, score: s });
   queue.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
   queue.length = Math.min(queue.length, KEEP);
+  // #region agent log
+  if (curTerm && ++_dbgAdmitN <= 25)
+    _dbg('A', 'admit:ok', 'admitted', { s, thr, kw, title: (t.title || '').slice(0, 50), tags: (t.tags || []).slice(0, 5).join(', '), kwN: queue.filter(keywordHit).length });
+  // #endregion
 }
 
 // оцінка батчу окремо від probe: ключові слова — одразу; смисловий скоринг — у слоті моделі
@@ -631,22 +760,39 @@ async function rankBatch(list, g) {
     if (qvec) seen.push(s);
     admit(t, s);
   }
-  // кеш теж «вибірка»: інакше scanned=0 → воркери вічно б'ють HF і глушать завантаження треку
+  // кеш теж «вибірка»: інакше scanned=0 → воркери вічно б'ють HF і глушать завантаження треку.
+  // considered росте ДО повторного проходу admit з м'якшим порогом (soft дивиться на explored).
   considered += list.length;
+  if (curTerm && qvec && !queue.length && Math.max(scanned, considered, seen.length) >= SOFT_AFTER) {
+    for (const t of list) {
+      const s = relevance(t);
+      if (s === null) continue;
+      admit(t, s);
+    }
+  }
   renderQueue();
 }
 
 async function worker(g, id) {
   while (g === gen) {
     const { slots, delay } = pace();
+    // #region agent log
+    if (localeOf(curTerm) && Date.now() - _dbgHungryAt > 2500) {
+      _dbgHungryAt = Date.now();
+      _dbg('B', 'worker:locale', 'locale hunt', { slots, kwN: queue.filter(keywordHit).length });
+    }
+    // #endregion
     if (id >= slots) { await sleep(delay || 400); continue; }   // ситі — сплять, не probe
     if (delay) await sleep(delay);
     if (!hungry()) { await sleep(400); continue; }
-    const list = await probeRun(curSources).catch(() => []);
+    const list = await probeRun(curSources, g).catch(() => []);
     if (g !== gen) return;
     if (!list.length) continue;
     // scanned росте одразу після Range-проби — не після embed
     scanned += list.length;
+    // #region agent log
+    if (localeOf(curTerm)) _dbg('B', 'worker:probed', 'HF probe', { got: list.length, kwHits: list.filter(keywordHit).length });
+    // #endregion
     for (const t of list) { pool.push(t); if (pool.length > 300) pool.shift(); }
     cachePut(list);   // JSON уже зчитані — лишаємо для наступних пошуків
     // радіо: пускаємо в чергу синхронно — не чекаємо async rankBatch (інакше Found відстає від scanned)
@@ -703,7 +849,9 @@ function renderChips() {
 }
 
 function renderQueue() {
-  $("found").textContent = (simTo ? t("simTo", simTo.title) + " · " : "") + t("found", queue.length, scanned);
+  $("found").textContent = (simTo ? t("simTo", simTo.title) + " · " : "") + t("found", queue.length, scanned, known);
+  // під час фонового пошуку тримаємо видимий прогрес у #status (навіть якщо грає попередній трек)
+  if (curTerm || simTo) showSearchStatus();
   const ul = $("queue");
   ul.innerHTML = queue.length ? "" : `<li class="empty">${t("searchingLi")}</li>`;
   queue.forEach(t => {
@@ -815,6 +963,8 @@ async function showStream(t, my, back, mime, mseType) {
       await appendBuf(sb, bytes.slice());
       if (!started) {
         started = true;
+        // playback уже пішов — не глушимо locale/HF-пошук на весь залишок стріму
+        audioBusy = false;
         setStatus(...sa, false, pctOf(t));
         fallbackUsed = false;
         audio.play().catch(() => setStatus(...sa, true, pctOf(t)));
@@ -952,19 +1102,18 @@ $("seg").onclick = e => {
   document.querySelectorAll("#seg button").forEach(b => b.classList.toggle("on", b.dataset.m === m));
   resetQueue(); next();
 };
-// дебаунс: після паузи в наборі (коротший, коли ще нічого не знайдено); Enter — одразу
-const DEBOUNCE = 400, DEBOUNCE_EMPTY = 150;
+// дебаунс набору: лише перебудовуємо чергу наступних — поточний трек не чіпаємо (Enter — теж без next)
+const DEBOUNCE = 400;
 $("q").oninput = () => {
   clearTimeout(qTimer);
-  const ms = queue.length ? DEBOUNCE : DEBOUNCE_EMPTY;
   qTimer = setTimeout(() => {
-    if (simTo || $("q").value.trim().toLowerCase() !== curTerm) { resetQueue(); next(); }
-  }, ms);
+    if (simTo || $("q").value.trim().toLowerCase() !== curTerm) resetQueue();
+  }, DEBOUNCE);
 };
 $("q").onkeydown = e => {
   if (e.key !== "Enter") return;
   clearTimeout(qTimer);
-  resetQueue(); next();
+  resetQueue();
 };
 $("q").onfocus = () => loadModel();
 $("sim").onclick = () => { if (current) { resetQueue(current); next(); } };
@@ -997,6 +1146,7 @@ let v0 = 0.8; try { v0 = parseFloat(localStorage.getItem(VOL_KEY)); if (isNaN(v0
 setVol(v0);
 
 applyLang();
+refreshKnown();   // скільки JSON уже в IndexedDB після попередніх сесій
 loadModel();   // тягнемо модель одразу — перший смисловий пошук не стоїть на завантаженні
 resetQueue();
 next();
