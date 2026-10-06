@@ -428,10 +428,12 @@ async function probeRun(sources) {
 
 // ---------- фонова черга: пошук іде постійно, знайдене складається в чергу ----------
 // Порожня черга → усі воркери без паузи; що більше збігів — то менше активних і довша пауза.
-const WORKERS_MAX = 12, WORKERS_MIN = 1;
+// Probe і embed розведені: Range-скан не чекає на модель — лічильник scanned росте одразу.
+const WORKERS_MAX = 16, WORKERS_MIN = 1;
+const EMBED_SLOTS = 4;   // скільки батчів одночасно годуємо модель (решта чекає слота, probe крутиться далі)
 function pace() {
   const n = queue.length;
-  if (n === 0) return { slots: WORKERS_MAX, delay: 0 };
+  if (n === 0) return { slots: WORKERS_MAX, delay: 0 };   // Found: 0 → повний газ
   const fill = Math.min(1, n / KEEP);
   return {
     slots: Math.max(WORKERS_MIN, Math.round(WORKERS_MAX * (1 - fill * 0.9))),
@@ -440,9 +442,23 @@ function pace() {
 }
 let fallbackUsed = false, queue = [], gen = 0, scanned = 0, curTerm = "", curSources = SOURCES;
 let simTo = null, qvec = null, qReady = Promise.resolve(), seen = [];
-let qTimer = 0;
+let qTimer = 0, embedInflight = 0;
+const embedWait = [];
 const pool = [];   // усі переглянуті треки (навіть ті, що не підійшли під фільтр) — запасний варіант для «Далі»
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+function withEmbedSlot(fn) {
+  return new Promise((resolve, reject) => {
+    const run = () => {
+      embedInflight++;
+      Promise.resolve()
+        .then(fn)
+        .then(resolve, reject)
+        .finally(() => { embedInflight--; embedWait.shift()?.(); });
+    };
+    if (embedInflight < EMBED_SLOTS) run();
+    else embedWait.push(run);
+  });
+}
 
 function resetQueue(similar) {
   clearTimeout(qTimer);
@@ -462,28 +478,53 @@ function resetQueue(similar) {
   for (let i = 0; i < WORKERS_MAX; i++) worker(gen, i);
 }
 
+function admit(t, s) {
+  const thr = threshold();
+  if (s < thr || queue.some(x => same(x, t)) || (current && same(current, t)) || (simTo && same(simTo, t))) return;
+  queue.push({ ...t, score: s });
+  if (qvec) { queue.sort((a, b) => b.score - a.score); queue.length = Math.min(queue.length, KEEP); }
+}
+
+// оцінка батчу окремо від probe: ключові слова — одразу; смисловий скоринг — у слоті моделі
+async function rankBatch(list, g) {
+  // точний збіг слів не чекає на вектор запиту
+  if (curTerm && !qvec) {
+    for (const t of list) {
+      if (g !== gen) return;
+      if (!passesMode(t) || !keywordHit(t)) continue;
+      admit(t, 1);
+    }
+    renderQueue();
+  }
+  await qReady;
+  if (g !== gen) return;
+  if (qvec) await withEmbedSlot(() => embedTracks(list, g).catch(() => {}));
+  if (g !== gen) return;
+  for (const t of list) {
+    const s = relevance(t);
+    if (s === null) continue;
+    if (qvec) seen.push(s);
+    admit(t, s);
+  }
+  renderQueue();
+}
+
 async function worker(g, id) {
   while (g === gen) {
     const { slots, delay } = pace();
     if (id >= slots) { await sleep(400); continue; }   // зайві воркери сплять, коли черга вже росте
-    // на старті смислового пошуку не гальмуємо, поки мало збігів і не накопичили MIN_SCAN
-    if (delay && !(qvec && scanned < MIN_SCAN && queue.length < 3)) await sleep(delay);
+    // турбо, поки черга порожня / мало збігів і не накопичили MIN_SCAN
+    if (delay && !(scanned < MIN_SCAN && queue.length < 3)) await sleep(delay);
     const list = await probeRun(curSources).catch(() => []);
-    await qReady;
-    if (qvec) await embedTracks(list, g).catch(() => {});
     if (g !== gen) return;
-    for (const t of list) {
-      scanned++;
-      pool.push(t); if (pool.length > 300) pool.shift();
-      const s = relevance(t);
-      if (s === null) continue;
-      if (qvec) seen.push(s);
-      const thr = threshold();
-      if (s < thr || queue.some(x => same(x, t)) || (current && same(current, t)) || (simTo && same(simTo, t))) continue;
-      queue.push({ ...t, score: s });
-    }
-    if (qvec) { queue.sort((a, b) => b.score - a.score); queue.length = Math.min(queue.length, KEEP); }   // найкращі збіги — першими
+    if (!list.length) continue;
+    // scanned росте одразу після Range-проби — не після embed
+    scanned += list.length;
+    for (const t of list) { pool.push(t); if (pool.length > 300) pool.shift(); }
     renderQueue();
+    // без await, поки черга оцінки не роздулась; інакше трохи притискаємо probe
+    if (embedWait.length > WORKERS_MAX) await rankBatch(list, g);
+    else rankBatch(list, g);
   }
 }
 
@@ -626,14 +667,21 @@ $("seg").onclick = e => {
   document.querySelectorAll("#seg button").forEach(b => b.classList.toggle("on", b.dataset.m === m));
   resetQueue(); next();
 };
-// дебаунс: пошук стартує, коли людина на мить перестала друкувати; Enter — одразу
-const DEBOUNCE = 600;
+// дебаунс: після паузи в наборі (коротший, коли ще нічого не знайдено); Enter — одразу
+const DEBOUNCE = 400, DEBOUNCE_EMPTY = 150;
 $("q").oninput = () => {
   clearTimeout(qTimer);
-  qTimer = setTimeout(() => { if (simTo || $("q").value.trim().toLowerCase() !== curTerm) { resetQueue(); next(); } }, DEBOUNCE);
+  const ms = queue.length ? DEBOUNCE : DEBOUNCE_EMPTY;
+  qTimer = setTimeout(() => {
+    if (simTo || $("q").value.trim().toLowerCase() !== curTerm) { resetQueue(); next(); }
+  }, ms);
 };
-$("q").onkeydown = e => { if (e.key === "Enter") { resetQueue(); next(); } };
-$("q").onfocus = () => loadModel();   // модель важка — починаємо тягнути, щойно людина збирається шукати
+$("q").onkeydown = e => {
+  if (e.key !== "Enter") return;
+  clearTimeout(qTimer);
+  resetQueue(); next();
+};
+$("q").onfocus = () => loadModel();
 $("sim").onclick = () => { if (current) { resetQueue(current); next(); } };
 $("next").onclick = () => next();
 // як у звичайних плеєрах: якщо трек грає вже кілька секунд або історія порожня — починаємо його спочатку, інакше йдемо до попереднього
@@ -663,6 +711,7 @@ let v0 = 0.8; try { v0 = parseFloat(localStorage.getItem(VOL_KEY)); if (isNaN(v0
 setVol(v0);
 
 applyLang();
+loadModel();   // тягнемо модель одразу — перший смисловий пошук не стоїть на завантаженні
 resetQueue();
 next();
 </script>
