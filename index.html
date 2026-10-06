@@ -113,9 +113,67 @@ const REPO = "https://huggingface.co/datasets/ai-music/ai-music-deduplicated/";
 const SOURCES = ["suno", "udio", "riffusion", "mureka", "sonauto"];
 const CHUNK = 4 * 1024 * 1024;          // скільки читаємо за раз, шукаючи початок наступного треку в tar
 const LIKES_KEY = "genmus.likes.v2";
+const CACHE_DB = "genmus", CACHE_STORE = "tracks", CACHE_VER = 1, CACHE_MAX = 5000;
 const $ = id => document.getElementById(id);
 const audio = $("audio");
 const dec = new TextDecoder();
+const trackKey = t => t.path + "#" + t.pos;
+
+// ---------- IndexedDB: усі вже зчитані JSON-метадані (для повторного семантичного пошуку без HF) ----------
+let cacheDb = null;
+function openCache() {
+  if (cacheDb) return Promise.resolve(cacheDb);
+  return new Promise((resolve, reject) => {
+    const r = indexedDB.open(CACHE_DB, CACHE_VER);
+    r.onupgradeneeded = () => r.result.createObjectStore(CACHE_STORE, { keyPath: "key" });
+    r.onsuccess = () => resolve(cacheDb = r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+function cacheRecord(t) {
+  // без blob/raw — лише те, що треба для відтворення й embedding
+  const { path, source, pos, size, ext, title, tags, vocals, style, text, haystack, emb } = t;
+  return { key: trackKey(t), path, source, pos, size, ext, title, tags, vocals, style, text, haystack, emb: emb || null, at: Date.now() };
+}
+async function cachePut(list) {
+  if (!list?.length) return;
+  try {
+    const db = await openCache();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(CACHE_STORE, "readwrite");
+      const st = tx.objectStore(CACHE_STORE);
+      for (const t of list) st.put(cacheRecord(t));
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+    const n = await new Promise((resolve, reject) => {
+      const r = db.transaction(CACHE_STORE, "readonly").objectStore(CACHE_STORE).count();
+      r.onsuccess = () => resolve(r.result);
+      r.onerror = () => reject(r.error);
+    });
+    if (n <= CACHE_MAX) return;
+    const all = await cacheList();
+    const drop = all.sort((a, b) => (a.at || 0) - (b.at || 0)).slice(0, all.length - CACHE_MAX);
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(CACHE_STORE, "readwrite");
+      const st = tx.objectStore(CACHE_STORE);
+      for (const t of drop) st.delete(t.key);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (e) { console.warn("track cache:", e); }
+}
+async function cacheList() {
+  try {
+    const db = await openCache();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(CACHE_STORE, "readonly");
+      const r = tx.objectStore(CACHE_STORE).getAll();
+      r.onsuccess = () => resolve(r.result || []);
+      r.onerror = () => reject(r.error);
+    });
+  } catch (e) { console.warn("track cache:", e); return []; }
+}
 
 // ---------- i18n (English by default, switchable) ----------
 const I = {
@@ -208,14 +266,18 @@ async function range(path, a, b) {
   throw new Error("rate limited");
 }
 
-let filesCache = null;
+let filesCache = null, filesPending = null;
 async function listFiles() {
   if (filesCache) return filesCache;
-  const parts = await Promise.all(SOURCES.map(async s => {
-    const r = await fetch(`https://huggingface.co/api/datasets/ai-music/ai-music-deduplicated/tree/main/${s}`);
-    return (await r.json()).filter(f => f.path.endsWith(".tar")).map(f => ({ path: f.path, size: f.size, source: s }));
-  }));
-  return (filesCache = parts.flat());
+  // один спільний запит: інакше 16 воркерів одночасно б'ють tree API
+  if (!filesPending) {
+    filesPending = Promise.all(SOURCES.map(async s => {
+      const r = await fetch(`https://huggingface.co/api/datasets/ai-music/ai-music-deduplicated/tree/main/${s}`);
+      return (await r.json()).filter(f => f.path.endsWith(".tar")).map(f => ({ path: f.path, size: f.size, source: s }));
+    })).then(parts => (filesCache = parts.flat()))
+      .finally(() => { filesPending = null; });
+  }
+  return filesPending;
 }
 
 async function pickFile(sources) {
@@ -400,13 +462,18 @@ async function embedTags(list, g) {
   const v = await embed(fresh, g);
   if (v) fresh.forEach((x, i) => tagVecs.set(x, v[i]));
 }
+const EMBED_BATCH = 32;   // не годуємо модель тисячами текстів за раз (кеш може бути великий)
 async function embedTracks(list, g) {
   const need = list.filter(x => !x.emb);
-  if (!need.length) return;
-  const v = await embedPairs(need, g);
-  if (!v) return;
-  await embedTags(need, g);
-  need.forEach((x, i) => x.emb = { ...v[i], tags: tagsOf(x).map(k => tagVecs.get(k)).filter(Boolean) });
+  for (let i = 0; i < need.length; i += EMBED_BATCH) {
+    if (g !== gen) return;
+    const chunk = need.slice(i, i + EMBED_BATCH);
+    const v = await embedPairs(chunk, g);
+    if (!v) return;
+    await embedTags(chunk, g);
+    chunk.forEach((x, j) => x.emb = { ...v[j], tags: tagsOf(x).map(k => tagVecs.get(k)).filter(Boolean) });
+    cachePut(chunk);   // оновлюємо кеш уже з векторами — наступний пошук без повторного embed
+  }
 }
 // стиль зі стилем, текст із текстом; якщо однієї частини нема — рахуємо за іншою.
 // Стиль для текстового запиту = середнє між усім рядком тегів і найближчим окремим тегом
@@ -454,18 +521,30 @@ async function probeRun(sources) {
   return out;
 }
 
-// ---------- фонова черга: пошук іде постійно, знайдене складається в чергу ----------
-// Порожня черга → усі воркери без паузи; що більше збігів — то менше активних і довша пауза.
+// ---------- фонова черга: пошук іде, поки немає що грати ----------
+// Браузер тримає ~6 з'єднань на хост — більше воркерів лише створює pending і гальмує перший scanned.
 // Probe і embed розведені: Range-скан не чекає на модель — лічильник scanned росте одразу.
-const WORKERS_MAX = 16, WORKERS_MIN = 1;
-const EMBED_SLOTS = 4;   // скільки батчів одночасно годуємо модель (решта чекає слота, probe крутиться далі)
+// Без запиту — режим радіо: знайшли трек → стоп. Смисловий: добираємо вибірку, потім теж стоп.
+const WORKERS_MAX = 6, WORKERS_MIN = 1;
+const EMBED_SLOTS = 2;   // скільки батчів одночасно годуємо модель (решта чекає слота, probe крутиться далі)
+const BUFFER = 1;        // без запиту тримаємо в черзі лише стільки — інакше UI тоне в музонах
+function hungry() {
+  if (curTerm || simTo) {
+    if (queue.length >= KEEP) return false;
+    // перший збіг уже є і вибірка назбирана — далі не ганяємо probe
+    if (queue.length > 0 && scanned >= MIN_SCAN) return false;
+    return true;
+  }
+  return queue.length < BUFFER;
+}
 function pace() {
+  if (!hungry()) return { slots: 0, delay: 800 };
   const n = queue.length;
-  if (n === 0) return { slots: WORKERS_MAX, delay: 0 };   // Found: 0 → повний газ
+  if (n === 0) return { slots: WORKERS_MAX, delay: 0 };
   const fill = Math.min(1, n / KEEP);
   return {
     slots: Math.max(WORKERS_MIN, Math.round(WORKERS_MAX * (1 - fill * 0.9))),
-    delay: Math.round(300 + fill * fill * 3700),   // ~0.3 с → ~4 с при повній черзі
+    delay: Math.round(300 + fill * fill * 3700),
   };
 }
 let fallbackUsed = false, queue = [], gen = 0, scanned = 0, curTerm = "", curSources = SOURCES;
@@ -503,14 +582,36 @@ function resetQueue(similar) {
   // у Mureka немає ні текстів, ні ознаки «інструментал» — їх пропускаємо при фільтрі
   curSources = mode !== "all" ? SOURCES.filter(s => s !== "mureka") : SOURCES;
   renderQueue();
+  // спочатку семантичний скоринг уже закачаних JSON — без нових Range-запитів
+  if (curTerm || simTo) rankCached(g);
   for (let i = 0; i < WORKERS_MAX; i++) worker(gen, i);
+}
+
+// оцінити весь локальний каталог метаданих батчами; scanned не чіпаємо — це не HF-probe
+async function rankCached(g) {
+  const list = await cacheList();
+  if (!list.length || g !== gen) return;
+  for (const t of list) {
+    if (pool.some(x => same(x, t))) continue;
+    pool.push(t);
+    if (pool.length > 300) pool.shift();
+  }
+  const N = 40;
+  for (let i = 0; i < list.length; i += N) {
+    if (g !== gen) return;
+    await rankBatch(list.slice(i, i + N), g);
+  }
 }
 
 function admit(t, s) {
   const thr = threshold();
   if (s < thr || queue.some(x => same(x, t)) || (current && same(current, t)) || (simTo && same(simTo, t))) return;
+  const cap = (curTerm || simTo) ? KEEP : BUFFER;
+  // якщо топ повний — пускаємо лише кращих за найгірший (інакше кеш із тисяч треків не витіснить слабкі збіги)
+  if (queue.length >= cap && s <= (queue[queue.length - 1].score ?? 0)) return;
   queue.push({ ...t, score: s });
-  if (qvec) { queue.sort((a, b) => b.score - a.score); queue.length = Math.min(queue.length, KEEP); }
+  queue.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+  queue.length = Math.min(queue.length, cap);
 }
 
 // оцінка батчу окремо від probe: ключові слова — одразу; смисловий скоринг — у слоті моделі
@@ -538,17 +639,21 @@ async function rankBatch(list, g) {
 }
 
 async function worker(g, id) {
+  // легке розведення старту, щоб не бити HF одним залпом
+  if (id) await sleep(id * 80);
   while (g === gen) {
     const { slots, delay } = pace();
-    if (id >= slots) { await sleep(400); continue; }   // зайві воркери сплять, коли черга вже росте
-    // турбо, поки черга порожня / мало збігів і не накопичили MIN_SCAN
-    if (delay && !(scanned < MIN_SCAN && queue.length < 3)) await sleep(delay);
+    if (id >= slots) { await sleep(delay || 400); continue; }   // ситі / зайві — сплять, не probe
+    // турбо лише поки ще голодні й мало збігів
+    if (delay && !(scanned < MIN_SCAN && queue.length < 3 && hungry())) await sleep(delay);
+    if (!hungry()) { await sleep(400); continue; }
     const list = await probeRun(curSources).catch(() => []);
     if (g !== gen) return;
     if (!list.length) continue;
     // scanned росте одразу після Range-проби — не після embed
     scanned += list.length;
     for (const t of list) { pool.push(t); if (pool.length > 300) pool.shift(); }
+    cachePut(list);   // JSON уже зчитані — лишаємо для наступних пошуків
     renderQueue();
     // без await, поки черга оцінки не роздулась; інакше трохи притискаємо probe
     if (embedWait.length > WORKERS_MAX) await rankBatch(list, g);
@@ -556,29 +661,28 @@ async function worker(g, id) {
   }
 }
 
-// якщо черга порожня — не чекаємо, а граємо будь-який відомий трек (лайки, історія, переглянуте), перевагу мають ті, що підходять під фільтр
+// під час текстового/«схожі» пошуку — лише релевантні; інакше можна взяти будь-який відомий
 function fallbackTrack(onlyFit) {
   const known = [...loadLikes(), ...history, ...pool].filter(x => !(current && same(x, current)) && !(simTo && same(x, simTo)));
   if (!known.length) return null;
-  // з уже відомих — найближчі за змістом (випадково з п'яти найкращих)
-  const fit = known.map(x => ({ ...x, score: relevance(x) })).filter(x => x.score !== null && x.score >= (qvec ? MIN_SIM : 1))
+  const min = qvec ? MIN_SIM : 1;
+  const fit = known.map(x => ({ ...x, score: relevance(x) })).filter(x => x.score !== null && x.score >= min)
     .sort((a, b) => b.score - a.score).slice(0, 5);
-  if (onlyFit && !fit.length) return null;
+  if (onlyFit) return fit.length ? fit[Math.floor(Math.random() * fit.length)] : null;
   const src = fit.length ? fit : known;
   return src[Math.floor(Math.random() * src.length)];
 }
 
 async function takeNext(my) {
+  const searching = () => !!(curTerm || simTo);
   while (my === token) {
     if (queue.length) { const t = queue.shift(); renderQueue(); return t; }
-    // черга порожня — «Далі» не чекає на пошук: найближчий з відомих, інакше будь-який відомий, інакше свіжий випадковий
-    const f = fallbackTrack(false);
+    // активний пошук: лише релевантні з відомих; інакше будь-який відомий
+    const f = fallbackTrack(searching());
     if (f) { fallbackUsed = true; return f; }
-    const [r] = await probeRun(SOURCES).catch(() => []);
-    if (my !== token) return undefined;
-    if (r) { fallbackUsed = true; return r; }
-    setStatus("waiting", scanned);
-    await sleep(300);
+    // не стартуємо окремий probe — він конкурує з воркерами і дає трек без scanned++
+    setStatus(searching() ? "waiting" : "searching", ...(searching() ? [scanned] : []));
+    await sleep(250);
   }
   return undefined;
 }
