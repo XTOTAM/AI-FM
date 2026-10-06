@@ -529,10 +529,12 @@ async function probeRun(sources) {
 // Без запиту — радіо: будь-який трек підходить, набираємо KEEP і стоп. Смисловий: топ після MIN_SCAN, теж стоп.
 const WORKERS_MAX = 6, WORKERS_MIN = 1;
 const EMBED_SLOTS = 2;   // скільки батчів одночасно годуємо модель (решта чекає слота, probe крутиться далі)
+let audioBusy = false;   // під час Range аудіо — воркери мовчать, інакше HF-з'єднання забиті й трек «вічно Loading»
 function hungry() {
+  if (audioBusy) return false;
   if (queue.length >= KEEP) return false;
-  // смисловий: перший збіг уже є і вибірка назбирана — далі не ганяємо probe
-  if ((curTerm || simTo) && queue.length > 0 && scanned >= MIN_SCAN) return false;
+  // смисловий: є збіги і вибірка назбирана (HF-probe або локальний кеш — scanned лишається 0)
+  if ((curTerm || simTo) && queue.length > 0 && Math.max(scanned, considered) >= MIN_SCAN) return false;
   return true;
 }
 function pace() {
@@ -545,7 +547,7 @@ function pace() {
     delay: Math.round(300 + fill * fill * 3700),
   };
 }
-let fallbackUsed = false, queue = [], gen = 0, scanned = 0, curTerm = "", curSources = SOURCES;
+let fallbackUsed = false, queue = [], gen = 0, scanned = 0, considered = 0, curTerm = "", curSources = SOURCES;
 let simTo = null, qvec = null, qReady = Promise.resolve(), seen = [];
 let qTimer = 0, embedInflight = 0;
 const embedWait = [];
@@ -567,7 +569,7 @@ function withEmbedSlot(fn) {
 
 function resetQueue(similar) {
   clearTimeout(qTimer);
-  const g = ++gen; queue = []; scanned = 0; seen = []; qvec = null;
+  const g = ++gen; queue = []; scanned = 0; considered = 0; seen = []; qvec = null;
   simTo = similar || null;
   if (simTo) $("q").value = "";
   curTerm = $("q").value.trim().toLowerCase();
@@ -639,6 +641,8 @@ async function rankBatch(list, g) {
     if (qvec) seen.push(s);
     admit(t, s);
   }
+  // кеш теж «вибірка»: інакше scanned=0 → воркери вічно б'ють HF і глушать завантаження треку
+  considered += list.length;
   renderQueue();
 }
 
@@ -737,7 +741,14 @@ function updatePrev() { saveHistory(); }
 
 async function show(t, my, back) {
   setStatus("loading");
-  const bytes = await range(t.path, t.pos + 512, t.pos + 511 + t.size);
+  // пріоритет playback: поки тягнемо байти треку — probe не займає 6 слотів до HF
+  audioBusy = true;
+  let bytes;
+  try {
+    bytes = await range(t.path, t.pos + 512, t.pos + 511 + t.size);
+  } finally {
+    if (my === token) audioBusy = false;
+  }
   if (my !== token) return;
   const blob = new Blob([bytes], { type: MIME[t.ext] });
   if (objUrl) URL.revokeObjectURL(objUrl);
@@ -757,6 +768,10 @@ async function show(t, my, back) {
 
 async function next(fixed, back) {
   const my = ++token;
+  // скасований show більше не тримає слоти; інакше takeNext чекає чергу, а воркери сплять
+  audioBusy = false;
+  // щоб onended старого треку не скасував щойно вибраний next/play зі списку
+  try { audio.pause(); } catch {}
   $("disc").classList.remove("spin");
   setStatus("searching");
   try {
@@ -764,7 +779,7 @@ async function next(fixed, back) {
     if (my !== token || t === undefined) return;
     await show(t, my, back);
   } catch (e) {
-    if (my === token) setStatus("error");
+    if (my === token) { audioBusy = false; setStatus("error"); }
   }
 }
 
@@ -888,7 +903,8 @@ $("prev").onclick = () => {
 };
 audio.onplay = () => $("disc").classList.add("spin");
 audio.onpause = () => $("disc").classList.remove("spin");
-audio.onended = () => next();
+// під час load не стартуємо ще один next — інакше token++ скасовує fetch і лишається «Loading…»
+audio.onended = () => { if (!audioBusy) next(); };
 
 // ---------- гучність ----------
 const VOL_KEY = "genmus.volume";
