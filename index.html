@@ -373,8 +373,8 @@ const SOFT_MIN = 0.2;     // м'якша підлога, поки черга п�
 const SOFT_AFTER = 100;   // після стількох переглядів без збігів — допускаємо SOFT_MIN
 const STYLE_W = 0.7;      // жанр/теги важать більше, ніж назва й текст пісні
 const TOP_SHARE = 0.2;    // і серед переглянутих беремо лише найкращі ~20%
-const MIN_SCAN = 120;     // при смисловому пошуку не зупиняємось на перших збігах — є з чого вибрати найкращі
-const KEEP = 15;          // скільки найкращих кандидатів тримаємо в черзі
+const MIN_QUEUE = 5;      // завжди тримаємо мінімум стільки знайдених наступних
+const KEEP = 15;          // верхня межа черги (кеш/залп може набрати більше за MIN_QUEUE)
 let embedder = null, aiState = null;
 function setAi(...a) { aiState = a.length ? a : null; $("ai").textContent = a.length ? t(...a) : ""; }
 // Модель крутиться у Web Worker, щоб WASM-обчислення не вішали інтерфейс під час набору запиту
@@ -523,29 +523,19 @@ async function probeRun(sources) {
   return out;
 }
 
-// ---------- фонова черга: пошук іде, поки немає що грати ----------
-// Браузер тримає ~6 з'єднань на хост — більше воркерів лише створює pending і гальмує перший scanned.
+// ---------- фонова черга: завжди мінімум MIN_QUEUE наступних ----------
 // Probe і embed розведені: Range-скан не чекає на модель — лічильник scanned росте одразу.
-// Без запиту — радіо: будь-який трек підходить, набираємо KEEP і стоп. Смисловий: топ після MIN_SCAN, теж стоп.
-const WORKERS_MAX = 6, WORKERS_MIN = 1;
+// Один воркер, без пауз, поки Found < MIN_QUEUE. На 5+ — стоп (під час завантаження аудіо теж мовчимо).
+const WORKERS_MAX = 1;
 const EMBED_SLOTS = 2;   // скільки батчів одночасно годуємо модель (решта чекає слота, probe крутиться далі)
 let audioBusy = false;   // під час Range аудіо — воркери мовчать, інакше HF-з'єднання забиті й трек «вічно Loading»
 function hungry() {
   if (audioBusy) return false;
-  if (queue.length >= KEEP) return false;
-  // смисловий: є збіги і вибірка назбирана (HF-probe або локальний кеш — scanned лишається 0)
-  if ((curTerm || simTo) && queue.length > 0 && Math.max(scanned, considered) >= MIN_SCAN) return false;
-  return true;
+  return queue.length < MIN_QUEUE;
 }
 function pace() {
   if (!hungry()) return { slots: 0, delay: 800 };
-  const n = queue.length;
-  if (n === 0) return { slots: WORKERS_MAX, delay: 0 };
-  const fill = Math.min(1, n / KEEP);
-  return {
-    slots: Math.max(WORKERS_MIN, Math.round(WORKERS_MAX * (1 - fill * 0.9))),
-    delay: Math.round(300 + fill * fill * 3700),
-  };
+  return { slots: 1, delay: 0 };   // однопоточно, нон-стоп до MIN_QUEUE
 }
 let fallbackUsed = false, queue = [], gen = 0, scanned = 0, considered = 0, curTerm = "", curSources = SOURCES;
 let simTo = null, qvec = null, qReady = Promise.resolve(), seen = [];
@@ -647,13 +637,10 @@ async function rankBatch(list, g) {
 }
 
 async function worker(g, id) {
-  // легке розведення старту, щоб не бити HF одним залпом
-  if (id) await sleep(id * 80);
   while (g === gen) {
     const { slots, delay } = pace();
-    if (id >= slots) { await sleep(delay || 400); continue; }   // ситі / зайві — сплять, не probe
-    // турбо лише поки ще голодні й мало збігів
-    if (delay && !(scanned < MIN_SCAN && queue.length < 3 && hungry())) await sleep(delay);
+    if (id >= slots) { await sleep(delay || 400); continue; }   // ситі — сплять, не probe
+    if (delay) await sleep(delay);
     if (!hungry()) { await sleep(400); continue; }
     const list = await probeRun(curSources).catch(() => []);
     if (g !== gen) return;
