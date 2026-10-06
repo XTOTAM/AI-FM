@@ -206,9 +206,12 @@ const I = {
     saved: "Saved ❤", savedEmpty: "Nothing yet — like something.",
     found: (n, m, k) => `Found: ${n} · scanned ${m} · catalog ${k}/${CACHE_MAX}`, searchingLi: "Searching…",
     waiting: m => `Waiting for the first match… scanned ${m}`,
-    searchProg: (q, n, m) => n
-      ? `Searching “${q}”… ${n} in queue · scanned ${m}`
-      : `Searching “${q}”… scanned ${m}`,
+    searchProg: (q, n, m, best) => {
+      const tip = best != null ? ` · best ${best}%` : "";
+      return n
+        ? `Searching “${q}”… ${n} in queue · scanned ${m}${tip}`
+        : `Searching “${q}”… scanned ${m} · looking for a match…`;
+    },
     searching: "Looking for a track…", loading: "Loading track…",
     error: "Loading failed. Press “Next”.",
     track: (src, v, fb, hint, pct) => `${src} · ${v === true ? "🎤 with vocals" : v === false ? "🎹 instrumental" : "vocals: unknown"}` + (pct != null ? ` · ${pct}% match` : "") + (fb ? " · from already known (search continues)" : "") + (hint ? " · press ▶" : ""),
@@ -228,9 +231,12 @@ const I = {
     saved: "Збережене ❤", savedEmpty: "Поки порожньо — лайкни щось.",
     found: (n, m, k) => `Знайдено: ${n} · переглянуто ${m} · каталог ${k}/${CACHE_MAX}`, searchingLi: "Шукаю…",
     waiting: m => `Чекаю на перший збіг… переглянуто ${m}`,
-    searchProg: (q, n, m) => n
-      ? `Шукаю «${q}»… у черзі ${n} · переглянуто ${m}`
-      : `Шукаю «${q}»… переглянуто ${m}`,
+    searchProg: (q, n, m, best) => {
+      const tip = best != null ? ` · найкращий ${best}%` : "";
+      return n
+        ? `Шукаю «${q}»… у черзі ${n} · переглянуто ${m}${tip}`
+        : `Шукаю «${q}»… переглянуто ${m} · шукаю збіг…`;
+    },
     searching: "Шукаю трек…", loading: "Завантажую трек…",
     error: "Помилка завантаження. Натисни «Далі».",
     track: (src, v, fb, hint, pct) => `${src} · ${v === true ? "🎤 зі словами" : v === false ? "🎹 без слів" : "слова: невідомо"}` + (pct != null ? ` · збіг ${pct}%` : "") + (fb ? " · з уже відомих (новий пошук триває)" : "") + (hint ? " · натисни ▶" : ""),
@@ -581,13 +587,15 @@ function threshold() {
   }
   const explored = Math.max(scanned, considered, seen.length);
   const empty = !queue.length;
+  // soft лише поки черга порожня: щойно є збіги — знову MIN_SIM, щоб не добивати сміттям
   const floor = (empty && explored >= SOFT_AFTER) ? SOFT_MIN : MIN_SIM;
   if (seen.length < 20) return floor;
   const s = [...seen].sort((a, b) => b - a);
   const relative = s[Math.floor(s.length * TOP_SHARE)];
-  // порожня черга: тримаємо відносний топ від SOFT_MIN, інакше рідкі запити вічно з Found: 0
   if (empty) return Math.max(SOFT_MIN, relative);
-  return Math.max(floor, relative);
+  // уже є що слухати — поріг не нижче найгіршого в черзі і не нижче MIN_SIM
+  const worst = queue[queue.length - 1]?.score ?? 0;
+  return Math.max(floor, relative, queue.length >= MIN_QUEUE ? worst : 0);
 }
 const pctOf = n => qvec && n.score != null ? Math.round(Math.min(1, n.score) * 100) : null;
 
@@ -612,9 +620,9 @@ async function probeRun(sources, g) {
 // ---------- фонова черга: завжди мінімум MIN_QUEUE наступних ----------
 // Probe і embed розведені: Range-скан не чекає на модель — лічильник scanned росте одразу.
 // Радіо: один воркер до MIN_QUEUE. Текстовий/«схожі»: до KEEP, щоб слабкі збіги витіснялись хайкращими.
-const WORKERS_MAX = 1;
-const EMBED_SLOTS = 2;   // скільки батчів одночасно годуємо модель (решта чекає слота, probe крутиться далі)
-let audioBusy = false;   // під час Range аудіо — воркери мовчать, інакше HF-з'єднання забиті й трек «вічно Loading»
+const WORKERS_MAX = 8;     // пошук: до 8 паралельних probe; радіо — 1 (див. pace)
+const EMBED_SLOTS = 3;     // скільки батчів одночасно годуємо модель
+let audioBusy = false;     // під час Range аудіо — воркери мовчать, інакше HF-з'єднання забиті
 function hungry() {
   if (audioBusy) return false;
   if (localeOf(curTerm)) {
@@ -628,18 +636,22 @@ function hungry() {
 }
 function pace() {
   if (!hungry()) return { slots: 0, delay: 800 };
-  return { slots: 1, delay: 0 };   // однопоточно, нон-стоп до цілі черги
+  // радіо: один воркер — квоту HF бережемо для «Далі»
+  if (!curTerm && !simTo) return { slots: 1, delay: 0 };
+  const n = queue.length;
+  // порожня черга — турбо; що більше збігів, то менше probe і довша пауза
+  if (n === 0) return { slots: WORKERS_MAX, delay: 0 };
+  const fill = n / KEEP;
+  return {
+    slots: Math.max(1, Math.ceil(WORKERS_MAX * (1 - fill * 0.85))),
+    delay: Math.round(200 + fill * 2800),
+  };
 }
 function showSearchStatus() {
-  if (simTo) { setStatus("searchProg", t("simTo", simTo.title), queue.length, scanned); return; }
-  if (curTerm) { setStatus("searchProg", curTerm, queue.length, scanned); return; }
+  const best = queue[0]?.score != null ? Math.round(Math.min(1, queue[0].score) * 100) : null;
+  if (simTo) { setStatus("searchProg", t("simTo", simTo.title), queue.length, scanned, best); return; }
+  if (curTerm) { setStatus("searchProg", curTerm, queue.length, scanned, best); return; }
 }
-// #region agent log
-const _dbg = (hypothesisId, location, message, data = {}) => {
-  fetch('http://127.0.0.1:7838/ingest/ec659e91-a568-410b-a09d-cee7f64a578e',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f54bf4'},body:JSON.stringify({sessionId:'f54bf4',runId:'post-fix2',hypothesisId,location,message,data:{...data,qLen:queue.length,scanned,considered,curTerm,hasQvec:!!qvec,gen,thr: (curTerm&&qvec)?threshold():null,loc:!!localeOf(curTerm),h:hungry()},timestamp:Date.now()})}).catch(()=>{});
-};
-let _dbgAdmitN = 0, _dbgHungryAt = 0;
-// #endregion
 let fallbackUsed = false, queue = [], gen = 0, scanned = 0, considered = 0, curTerm = "", curSources = SOURCES;
 let simTo = null, qvec = null, qReady = Promise.resolve(), seen = [];
 let qTimer = 0, embedInflight = 0;
@@ -674,10 +686,6 @@ function resetQueue(similar) {
       .then(q => { if (g === gen && q) qvec = q; }).catch(() => {});
   // у Mureka немає ні текстів, ні ознаки «інструментал» — їх пропускаємо при фільтрі
   curSources = mode !== "all" ? SOURCES.filter(s => s !== "mureka") : SOURCES;
-  // #region agent log
-  _dbgAdmitN = 0;
-  _dbg('A', 'resetQueue', 'search reset', { g, term: curTerm });
-  // #endregion
   showSearchStatus();
   renderQueue();
   // кеш завжди: радіо одразу набирає вже відомі треки; запит — семантичний скоринг без нових Range
@@ -701,6 +709,12 @@ async function rankCached(g) {
   }
 }
 
+function pruneSoftJunk() {
+  // щойно є нормальний збіг — викидаємо soft-сміття (< MIN_SIM), лишаємо keyword
+  if (!curTerm && !simTo) return;
+  if (!queue.some(t => (t.score ?? 0) >= MIN_SIM || keywordHit(t))) return;
+  queue = queue.filter(t => (t.score ?? 0) >= MIN_SIM || keywordHit(t));
+}
 function admit(t, s) {
   if (s == null || queue.some(x => same(x, t)) || (current && same(current, t)) || (simTo && same(simTo, t))) return;
   // радіо: будь-який трек підходить — просто набираємо KEEP, без гри порогів
@@ -712,31 +726,18 @@ function admit(t, s) {
   const thr = threshold();
   if (s < thr) return;
   const kw = keywordHit(t);
-  if (localeBlocked(t)) {
-    // #region agent log
-    if (_dbgAdmitN < 8) _dbg('C', 'admit:locale-block', 'latin without italian', { s, title: (t.title || '').slice(0, 40), tags: (t.tags || []).slice(0, 4).join(', ') });
-    // #endregion
-    return;
-  }
+  if (localeBlocked(t)) return;
   // поки в черзі мало keyword — не забиваємо її «майже italian/german» з кешу
   if (localeOf(curTerm) && !kw) {
     const kwN = queue.filter(keywordHit).length;
-    if (kwN < MIN_QUEUE || s < LOCALE_STRICT) {
-      // #region agent log
-      if (_dbgAdmitN < 12) _dbg('C', 'admit:locale-skip', 'wait for kw hits', { s, thr, kwN, title: (t.title || '').slice(0, 40) });
-      // #endregion
-      return;
-    }
+    if (kwN < MIN_QUEUE || s < LOCALE_STRICT) return;
   }
   // якщо топ повний — пускаємо лише кращих за найгірший (інакше кеш із тисяч треків не витіснить слабкі збіги)
   if (queue.length >= KEEP && s <= (queue[queue.length - 1].score ?? 0)) return;
   queue.push({ ...t, score: s });
   queue.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
   queue.length = Math.min(queue.length, KEEP);
-  // #region agent log
-  if (curTerm && ++_dbgAdmitN <= 25)
-    _dbg('A', 'admit:ok', 'admitted', { s, thr, kw, title: (t.title || '').slice(0, 50), tags: (t.tags || []).slice(0, 5).join(', '), kwN: queue.filter(keywordHit).length });
-  // #endregion
+  pruneSoftJunk();
 }
 
 // оцінка батчу окремо від probe: ключові слова — одразу; смисловий скоринг — у слоті моделі
@@ -776,12 +777,6 @@ async function rankBatch(list, g) {
 async function worker(g, id) {
   while (g === gen) {
     const { slots, delay } = pace();
-    // #region agent log
-    if (localeOf(curTerm) && Date.now() - _dbgHungryAt > 2500) {
-      _dbgHungryAt = Date.now();
-      _dbg('B', 'worker:locale', 'locale hunt', { slots, kwN: queue.filter(keywordHit).length });
-    }
-    // #endregion
     if (id >= slots) { await sleep(delay || 400); continue; }   // ситі — сплять, не probe
     if (delay) await sleep(delay);
     if (!hungry()) { await sleep(400); continue; }
@@ -790,9 +785,6 @@ async function worker(g, id) {
     if (!list.length) continue;
     // scanned росте одразу після Range-проби — не після embed
     scanned += list.length;
-    // #region agent log
-    if (localeOf(curTerm)) _dbg('B', 'worker:probed', 'HF probe', { got: list.length, kwHits: list.filter(keywordHit).length });
-    // #endregion
     for (const t of list) { pool.push(t); if (pool.length > 300) pool.shift(); }
     cachePut(list);   // JSON уже зчитані — лишаємо для наступних пошуків
     // радіо: пускаємо в чергу синхронно — не чекаємо async rankBatch (інакше Found відстає від scanned)
@@ -1102,13 +1094,14 @@ $("seg").onclick = e => {
   document.querySelectorAll("#seg button").forEach(b => b.classList.toggle("on", b.dataset.m === m));
   resetQueue(); next();
 };
-// дебаунс набору: лише перебудовуємо чергу наступних — поточний трек не чіпаємо (Enter — теж без next)
-const DEBOUNCE = 400;
+// дебаунс набору: лише перебудовуємо чергу наступних — поточний трек не чіпаємо (Enter — миттєво)
 $("q").oninput = () => {
   clearTimeout(qTimer);
+  // поки збігів немає — швидше стартуємо новий запит
+  const ms = queue.length ? 400 : 150;
   qTimer = setTimeout(() => {
     if (simTo || $("q").value.trim().toLowerCase() !== curTerm) resetQueue();
-  }, DEBOUNCE);
+  }, ms);
 };
 $("q").onkeydown = e => {
   if (e.key !== "Enter") return;
