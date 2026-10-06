@@ -278,7 +278,9 @@ function normalize(m, source) {
 // Багатомовна embedding-модель прямо в браузері (transformers.js, ONNX/WASM): запит і опис треку
 // перетворюються на вектори, схожість = косинус. Українські запити знаходять англійські теги й навпаки.
 const MODEL = "Xenova/paraphrase-multilingual-MiniLM-L12-v2";
-const MIN_SIM = 0.4;      // нижче цього — вже не про те
+const MIN_SIM = 0.3;      // нижче цього — вже не про те (основний відбір — відносний, див. TOP_SHARE)
+const SOFT_MIN = 0.2;     // м'якша підлога, поки черга порожня після довгого скану
+const SOFT_AFTER = 100;   // після стількох переглядів без збігів — допускаємо SOFT_MIN
 const STYLE_W = 0.7;      // жанр/теги важать більше, ніж назва й текст пісні
 const TOP_SHARE = 0.2;    // і серед переглянутих беремо лише найкращі ~20%
 const MIN_SCAN = 120;     // при смисловому пошуку не зупиняємось на перших збігах — є з чого вибрати найкращі
@@ -359,15 +361,31 @@ async function embedPairs(list, g, urgent) {
   let i = 0;
   return list.map(n => ({ s: styleOf(n) ? v[i++] : null, t: textOf(n) ? v[i++] : null }));
 }
+// Окремі теги: у довгому списку («mysterious, ambient, soft, film score, …») одне слово розчиняється при усередненні,
+// тож запит «space ambient» порівнюємо ще й з кожним тегом. Теги дуже повторюються — вектори кешуємо.
+const tagVecs = new Map();
+const tagsOf = n => [...new Set((n.tags || []).slice(0, 12).map(x => x.toLowerCase().slice(0, 60)))];
+async function embedTags(list, g) {
+  if (tagVecs.size > 20000) tagVecs.clear();
+  const fresh = [...new Set(list.flatMap(tagsOf))].filter(x => !tagVecs.has(x));
+  if (!fresh.length) return;
+  const v = await embed(fresh, g);
+  if (v) fresh.forEach((x, i) => tagVecs.set(x, v[i]));
+}
 async function embedTracks(list, g) {
   const need = list.filter(x => !x.emb);
   if (!need.length) return;
   const v = await embedPairs(need, g);
-  if (v) need.forEach((x, i) => x.emb = v[i]);
+  if (!v) return;
+  await embedTags(need, g);
+  need.forEach((x, i) => x.emb = { ...v[i], tags: tagsOf(x).map(k => tagVecs.get(k)).filter(Boolean) });
 }
-// стиль зі стилем, текст із текстом; якщо однієї частини нема — рахуємо за іншою
+// стиль зі стилем, текст із текстом; якщо однієї частини нема — рахуємо за іншою.
+// Стиль для текстового запиту = середнє між усім рядком тегів і найближчим окремим тегом
 function sim(q, e) {
-  const s = q.s && e.s ? dot(q.s, e.s) : null, t = q.t && e.t ? dot(q.t, e.t) : null;
+  let s = q.s && e.s ? dot(q.s, e.s) : null;
+  const t = q.t && e.t ? dot(q.t, e.t) : null;
+  if (s !== null && q.word && e.tags?.length) s = (s + Math.max(...e.tags.map(v => dot(q.word, v)))) / 2;
   return s === null ? (t ?? 0) : t === null ? s : STYLE_W * s + (1 - STYLE_W) * t;
 }
 const dot = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
@@ -382,12 +400,14 @@ function relevance(n) {
   if (qvec || !curTerm) return null;     // вектора треку ще нема / «схожі» без моделі
   return keywordHit(n) ? 1 : null;       // модель недоступна — старий пошук за словами
 }
-// поріг адаптивний: не нижче MIN_SIM і не гірше за топ-20% усього переглянутого в цьому пошуку
+// поріг адаптивний: не нижче підлоги і не гірше за топ-20% усього переглянутого в цьому пошуку;
+// поки черга порожня після SOFT_AFTER — підлога м'якша, щоб з сотень сканів хоч щось потрапило
 function threshold() {
   if (!qvec) return 1;
-  if (seen.length < 20) return MIN_SIM;
+  const floor = (!queue.length && scanned >= SOFT_AFTER) ? SOFT_MIN : MIN_SIM;
+  if (seen.length < 20) return floor;
   const s = [...seen].sort((a, b) => b - a);
-  return Math.max(MIN_SIM, s[Math.floor(s.length * TOP_SHARE)]);
+  return Math.max(floor, s[Math.floor(s.length * TOP_SHARE)]);
 }
 const pctOf = n => qvec && n.score != null ? Math.round(Math.min(1, n.score) * 100) : null;
 
@@ -407,7 +427,17 @@ async function probeRun(sources) {
 }
 
 // ---------- фонова черга: пошук іде постійно, знайдене складається в чергу ----------
-const WORKERS = 6;
+// Порожня черга → усі воркери без паузи; що більше збігів — то менше активних і довша пауза.
+const WORKERS_MAX = 12, WORKERS_MIN = 1;
+function pace() {
+  const n = queue.length;
+  if (n === 0) return { slots: WORKERS_MAX, delay: 0 };
+  const fill = Math.min(1, n / KEEP);
+  return {
+    slots: Math.max(WORKERS_MIN, Math.round(WORKERS_MAX * (1 - fill * 0.9))),
+    delay: Math.round(300 + fill * fill * 3700),   // ~0.3 с → ~4 с при повній черзі
+  };
+}
 let fallbackUsed = false, queue = [], gen = 0, scanned = 0, curTerm = "", curSources = SOURCES;
 let simTo = null, qvec = null, qReady = Promise.resolve(), seen = [];
 let qTimer = 0;
@@ -424,29 +454,31 @@ function resetQueue(similar) {
   qReady = !curTerm && !simTo ? Promise.resolve()
     : simTo && simTo.emb ? Promise.resolve(qvec = simTo.emb)
     : (simTo ? embedPairs([simTo], g, true).then(v => v && v[0])
-       : embed([curTerm], g, true).then(v => v && { s: v[0], t: v[0] }))   // текстовий запит порівнюємо і зі стилем, і з текстом
+       : embed([curTerm], g, true).then(v => v && { s: v[0], t: v[0], word: v[0] }))   // текстовий запит порівнюємо і зі стилем, і з текстом
       .then(q => { if (g === gen && q) qvec = q; }).catch(() => {});
   // у Mureka немає ні текстів, ні ознаки «інструментал» — їх пропускаємо при фільтрі
   curSources = mode !== "all" ? SOURCES.filter(s => s !== "mureka") : SOURCES;
   renderQueue();
-  for (let i = 0; i < WORKERS; i++) worker(gen);
+  for (let i = 0; i < WORKERS_MAX; i++) worker(gen, i);
 }
 
-async function worker(g) {
-  const target = 5;
+async function worker(g, id) {
   while (g === gen) {
-    if (queue.length >= target && !(qvec && scanned < MIN_SCAN)) { await sleep(500); continue; }
+    const { slots, delay } = pace();
+    if (id >= slots) { await sleep(400); continue; }   // зайві воркери сплять, коли черга вже росте
+    // на старті смислового пошуку не гальмуємо, поки мало збігів і не накопичили MIN_SCAN
+    if (delay && !(qvec && scanned < MIN_SCAN && queue.length < 3)) await sleep(delay);
     const list = await probeRun(curSources).catch(() => []);
     await qReady;
     if (qvec) await embedTracks(list, g).catch(() => {});
     if (g !== gen) return;
-    let thr = threshold();
     for (const t of list) {
       scanned++;
       pool.push(t); if (pool.length > 300) pool.shift();
       const s = relevance(t);
       if (s === null) continue;
       if (qvec) seen.push(s);
+      const thr = threshold();
       if (s < thr || queue.some(x => same(x, t)) || (current && same(current, t)) || (simTo && same(simTo, t))) continue;
       queue.push({ ...t, score: s });
     }
