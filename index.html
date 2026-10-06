@@ -498,6 +498,8 @@ function relevance(n) {
 // поріг адаптивний: не нижче підлоги і не гірше за топ-20% усього переглянутого в цьому пошуку;
 // поки черга порожня після SOFT_AFTER — підлога м'якша, щоб з сотень сканів хоч щось потрапило
 function threshold() {
+  // радіо (нема запиту) — поріг не потрібен; без qvec семантичний скоринг ще не готовий
+  if (!curTerm && !simTo) return 0;
   if (!qvec) return 1;
   const floor = (!queue.length && scanned >= SOFT_AFTER) ? SOFT_MIN : MIN_SIM;
   if (seen.length < 20) return floor;
@@ -524,18 +526,14 @@ async function probeRun(sources) {
 // ---------- фонова черга: пошук іде, поки немає що грати ----------
 // Браузер тримає ~6 з'єднань на хост — більше воркерів лише створює pending і гальмує перший scanned.
 // Probe і embed розведені: Range-скан не чекає на модель — лічильник scanned росте одразу.
-// Без запиту — режим радіо: знайшли трек → стоп. Смисловий: добираємо вибірку, потім теж стоп.
+// Без запиту — радіо: будь-який трек підходить, набираємо KEEP і стоп. Смисловий: топ після MIN_SCAN, теж стоп.
 const WORKERS_MAX = 6, WORKERS_MIN = 1;
 const EMBED_SLOTS = 2;   // скільки батчів одночасно годуємо модель (решта чекає слота, probe крутиться далі)
-const BUFFER = 1;        // без запиту тримаємо в черзі лише стільки — інакше UI тоне в музонах
 function hungry() {
-  if (curTerm || simTo) {
-    if (queue.length >= KEEP) return false;
-    // перший збіг уже є і вибірка назбирана — далі не ганяємо probe
-    if (queue.length > 0 && scanned >= MIN_SCAN) return false;
-    return true;
-  }
-  return queue.length < BUFFER;
+  if (queue.length >= KEEP) return false;
+  // смисловий: перший збіг уже є і вибірка назбирана — далі не ганяємо probe
+  if ((curTerm || simTo) && queue.length > 0 && scanned >= MIN_SCAN) return false;
+  return true;
 }
 function pace() {
   if (!hungry()) return { slots: 0, delay: 800 };
@@ -582,8 +580,8 @@ function resetQueue(similar) {
   // у Mureka немає ні текстів, ні ознаки «інструментал» — їх пропускаємо при фільтрі
   curSources = mode !== "all" ? SOURCES.filter(s => s !== "mureka") : SOURCES;
   renderQueue();
-  // спочатку семантичний скоринг уже закачаних JSON — без нових Range-запитів
-  if (curTerm || simTo) rankCached(g);
+  // кеш завжди: радіо одразу набирає вже відомі треки; запит — семантичний скоринг без нових Range
+  rankCached(g);
   for (let i = 0; i < WORKERS_MAX; i++) worker(gen, i);
 }
 
@@ -604,14 +602,20 @@ async function rankCached(g) {
 }
 
 function admit(t, s) {
+  if (s == null || queue.some(x => same(x, t)) || (current && same(current, t)) || (simTo && same(simTo, t))) return;
+  // радіо: будь-який трек підходить — просто набираємо KEEP, без гри порогів
+  if (!curTerm && !simTo) {
+    if (queue.length >= KEEP) return;
+    queue.push({ ...t, score: s });
+    return;
+  }
   const thr = threshold();
-  if (s < thr || queue.some(x => same(x, t)) || (current && same(current, t)) || (simTo && same(simTo, t))) return;
-  const cap = (curTerm || simTo) ? KEEP : BUFFER;
+  if (s < thr) return;
   // якщо топ повний — пускаємо лише кращих за найгірший (інакше кеш із тисяч треків не витіснить слабкі збіги)
-  if (queue.length >= cap && s <= (queue[queue.length - 1].score ?? 0)) return;
+  if (queue.length >= KEEP && s <= (queue[queue.length - 1].score ?? 0)) return;
   queue.push({ ...t, score: s });
   queue.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-  queue.length = Math.min(queue.length, cap);
+  queue.length = Math.min(queue.length, KEEP);
 }
 
 // оцінка батчу окремо від probe: ключові слова — одразу; смисловий скоринг — у слоті моделі
@@ -654,6 +658,15 @@ async function worker(g, id) {
     scanned += list.length;
     for (const t of list) { pool.push(t); if (pool.length > 300) pool.shift(); }
     cachePut(list);   // JSON уже зчитані — лишаємо для наступних пошуків
+    // радіо: пускаємо в чергу синхронно — не чекаємо async rankBatch (інакше Found відстає від scanned)
+    if (!curTerm && !simTo) {
+      for (const t of list) {
+        const s = relevance(t);
+        if (s !== null) admit(t, s);
+      }
+      renderQueue();
+      continue;
+    }
     renderQueue();
     // без await, поки черга оцінки не роздулась; інакше трохи притискаємо probe
     if (embedWait.length > WORKERS_MAX) await rankBatch(list, g);
