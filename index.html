@@ -47,6 +47,18 @@
   .lst li span, #list li span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
   .lst button, #list button { padding:6px 12px; font-size:12px }
   .empty { color:var(--mut) }
+  #metaBtn { font-family:ui-monospace,Menlo,monospace; font-size:12px; letter-spacing:-.5px }
+  .modal { position:fixed; inset:0; z-index:50; display:none; align-items:center; justify-content:center;
+           padding:16px; background:rgba(8,9,20,.72); backdrop-filter:blur(4px) }
+  .modal.on { display:flex }
+  .modal-box { background:var(--card); border-radius:16px; width:min(560px,100%); max-height:min(80vh,720px);
+               display:flex; flex-direction:column; text-align:left; overflow:hidden;
+               box-shadow:0 20px 60px rgba(0,0,0,.45) }
+  .modal-hd { display:flex; align-items:center; gap:10px; padding:14px 16px; border-bottom:1px solid #2b2c4d }
+  .modal-hd strong { flex:1; font-size:14px }
+  .modal-hd button { padding:6px 12px; font-size:12px }
+  .modal-box pre { margin:0; padding:14px 16px; overflow:auto; font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;
+                   color:#d6d7ee; white-space:pre-wrap; word-break:break-word }
 </style>
 </head>
 <body>
@@ -73,8 +85,20 @@
       <button id="prev" data-i18n="prev"></button>
       <button id="like"></button>
       <button id="dl" data-i18n="dl"></button>
+      <button id="metaBtn" title="JSON">{}</button>
       <button id="sim" data-i18n="sim"></button>
       <button id="next" data-i18n="next"></button>
+    </div>
+  </div>
+
+  <div class="modal" id="metaModal" role="dialog" aria-modal="true">
+    <div class="modal-box">
+      <div class="modal-hd">
+        <strong data-i18n="metaTitle"></strong>
+        <button type="button" id="metaCopy" data-i18n="metaCopy"></button>
+        <button type="button" id="metaClose">✕</button>
+      </div>
+      <pre id="metaPre"></pre>
     </div>
   </div>
 
@@ -111,6 +135,8 @@ const I = {
     error: "Loading failed. Press “Next”.",
     track: (src, v, fb, hint, pct) => `${src} · ${v === true ? "🎤 with vocals" : v === false ? "🎹 instrumental" : "vocals: unknown"}` + (pct != null ? ` · ${pct}% match` : "") + (fb ? " · from already known (search continues)" : "") + (hint ? " · press ▶" : ""),
     noTitle: "Untitled", limit: "Close to the Hugging Face rate limit — short pause",
+    metaTitle: "Search description (JSON)", metaCopy: "Copy", metaEmpty: "No track yet",
+    metaLoading: "Loading JSON…", metaErr: "Could not load metadata",
   },
   uk: {
     all: "Усі", vocal: "🎤 Зі словами", instr: "🎹 Без слів",
@@ -128,6 +154,8 @@ const I = {
     error: "Помилка завантаження. Натисни «Далі».",
     track: (src, v, fb, hint, pct) => `${src} · ${v === true ? "🎤 зі словами" : v === false ? "🎹 без слів" : "слова: невідомо"}` + (pct != null ? ` · збіг ${pct}%` : "") + (fb ? " · з уже відомих (новий пошук триває)" : "") + (hint ? " · натисни ▶" : ""),
     noTitle: "Без назви", limit: "Близько до ліміту Hugging Face — коротка пауза",
+    metaTitle: "Опис для пошуку (JSON)", metaCopy: "Копіювати", metaEmpty: "Ще немає треку",
+    metaLoading: "Завантажую JSON…", metaErr: "Не вдалося прочитати метадані",
   },
 };
 const LANG_KEY = "genmus.lang";
@@ -420,7 +448,7 @@ async function probeRun(sources) {
   for (let i = 0; i < RUN && t; i++) {
     let r;
     try { r = await readMetaAndNext(t); } catch { break; }
-    out.push({ ...t, ...normalize(r.meta, t.source) });
+    out.push({ ...t, ...normalize(r.meta, t.source), raw: r.meta });
     t = r.next;
   }
   return out;
@@ -597,7 +625,7 @@ async function show(t, my, back) {
   const blob = new Blob([bytes], { type: MIME[t.ext] });
   if (objUrl) URL.revokeObjectURL(objUrl);
   objUrl = URL.createObjectURL(blob);
-  if (current && !back) { const { blob: _b, emb: _e, score: _s, ...meta } = current; history.push(meta); if (history.length > 50) history.shift(); }
+  if (current && !back) { const { blob: _b, emb: _e, score: _s, raw: _r, ...meta } = current; history.push(meta); if (history.length > 50) history.shift(); }
   current = { ...t, blob };
   updatePrev();
   audio.src = objUrl;
@@ -650,6 +678,53 @@ $("like").onclick = () => {
   else { const { path, source, pos, size, ext, title, tags, vocals } = current; likes.unshift({ path, source, pos, size, ext, title, tags, vocals }); }
   saveLikes(likes); render(); updateLike();
 };
+
+// ---------- перегляд JSON-опису, по якому шукаємо ----------
+function searchDesc(t) {
+  return {
+    source: t.source,
+    title: t.title,
+    tags: t.tags,
+    vocals: t.vocals,
+    score: t.score ?? null,
+    // саме ці два рядки йдуть у embedding-модель
+    style: styleOf(t),
+    text: textOf(t),
+    raw: t.raw ?? null,
+  };
+}
+async function ensureRaw(t) {
+  if (t.raw) return t;
+  try {
+    const { meta } = await readMetaAndNext(t);
+    t.raw = meta;
+    // якщо трек прийшов зі збережених без style/text — добудуємо з сирого JSON
+    if (!t.style && !t.text) Object.assign(t, normalize(meta, t.source));
+  } catch {}
+  return t;
+}
+function openMetaModal(obj) {
+  $("metaPre").textContent = JSON.stringify(obj, null, 2);
+  $("metaModal").classList.add("on");
+}
+function closeMetaModal() { $("metaModal").classList.remove("on"); }
+$("metaBtn").onclick = async () => {
+  if (!current) { openMetaModal({ error: t("metaEmpty") }); return; }
+  $("metaPre").textContent = t("metaLoading");
+  $("metaModal").classList.add("on");
+  await ensureRaw(current);
+  if (!current.raw && !current.style && !current.text) {
+    $("metaPre").textContent = t("metaErr");
+    return;
+  }
+  openMetaModal(searchDesc(current));
+};
+$("metaClose").onclick = closeMetaModal;
+$("metaModal").onclick = e => { if (e.target === $("metaModal")) closeMetaModal(); };
+$("metaCopy").onclick = async () => {
+  try { await navigator.clipboard.writeText($("metaPre").textContent); } catch {}
+};
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeMetaModal(); });
 
 // ---------- збереження файлу ----------
 $("dl").onclick = () => {
