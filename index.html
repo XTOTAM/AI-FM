@@ -732,6 +732,8 @@ function renderQueue() {
 
 // ---------- відтворення ----------
 const MIME = { mp3: "audio/mpeg", m4a: "audio/mp4", ogg: "audio/ogg" };
+// стрім чанками: перший маленький — швидкий старт; далі більші — менше Range-запитів
+const STREAM_FIRST = 128 * 1024, STREAM_CHUNK = 512 * 1024;
 
 const HIST_KEY = "genmus.history";
 let history = [];   // вже програні треки (без аудіо), щоб можна було повернутися назад; переживає перезавантаження
@@ -739,10 +741,40 @@ try { history = JSON.parse(localStorage.getItem(HIST_KEY)) || []; } catch {}
 function saveHistory() { try { localStorage.setItem(HIST_KEY, JSON.stringify(history)) } catch {} }
 function updatePrev() { saveHistory(); }
 
-async function show(t, my, back) {
-  setStatus("loading");
-  // пріоритет playback: поки тягнемо байти треку — probe не займає 6 слотів до HF
-  audioBusy = true;
+function mseMime(ext) {
+  // m4a в tar — звичайний MP4, не fMP4; MSE майже завжди падає на append
+  if (typeof MediaSource === "undefined" || ext === "m4a") return null;
+  const list = {
+    mp3: ["audio/mpeg", 'audio/mpeg; codecs="mp3"'],
+    ogg: ['audio/ogg; codecs="vorbis"', "audio/ogg"],
+  }[ext] || [];
+  for (const m of list) if (MediaSource.isTypeSupported(m)) return m;
+  return null;
+}
+
+function appendBuf(sb, buf) {
+  return new Promise((resolve, reject) => {
+    const done = () => { sb.removeEventListener("updateend", done); sb.removeEventListener("error", fail); resolve(); };
+    const fail = () => { sb.removeEventListener("updateend", done); sb.removeEventListener("error", fail); reject(new Error("append")); };
+    sb.addEventListener("updateend", done);
+    sb.addEventListener("error", fail);
+    try { sb.appendBuffer(buf); } catch (e) { fail(); }
+  });
+}
+
+function bindTrack(t, back, blob) {
+  if (current && !back) {
+    const { blob: _b, emb: _e, score: _s, raw: _r, ...meta } = current;
+    history.push(meta); if (history.length > 50) history.shift();
+  }
+  current = { ...t, blob };
+  updatePrev();
+  $("title").textContent = t.title;
+  $("tags").textContent = t.tags.slice(0, 6).join(" · ");
+  updateLike();
+}
+
+async function showFull(t, my, back, mime) {
   let bytes;
   try {
     bytes = await range(t.path, t.pos + 512, t.pos + 511 + t.size);
@@ -750,20 +782,79 @@ async function show(t, my, back) {
     if (my === token) audioBusy = false;
   }
   if (my !== token) return;
-  const blob = new Blob([bytes], { type: MIME[t.ext] });
+  const blob = new Blob([bytes], { type: mime });
   if (objUrl) URL.revokeObjectURL(objUrl);
   objUrl = URL.createObjectURL(blob);
-  if (current && !back) { const { blob: _b, emb: _e, score: _s, raw: _r, ...meta } = current; history.push(meta); if (history.length > 50) history.shift(); }
-  current = { ...t, blob };
-  updatePrev();
+  bindTrack(t, back, blob);
   audio.src = objUrl;
-  $("title").textContent = t.title;
-  $("tags").textContent = t.tags.slice(0, 6).join(" · ");
   const sa = ["track", t.source, t.vocals, fallbackUsed];
   setStatus(...sa, false, pctOf(t));
   fallbackUsed = false;
-  updateLike();
   audio.play().catch(() => setStatus(...sa, true, pctOf(t)));
+}
+
+// progressive: перший чанк → play, решта докачується в MediaSource (воркери мовчать до кінця буфера)
+async function showStream(t, my, back, mime, mseType) {
+  const ms = new MediaSource();
+  if (objUrl) URL.revokeObjectURL(objUrl);
+  objUrl = URL.createObjectURL(ms);
+  bindTrack(t, back, null);
+  audio.src = objUrl;
+
+  await new Promise((resolve, reject) => {
+    ms.addEventListener("sourceopen", resolve, { once: true });
+    ms.addEventListener("error", () => reject(new Error("mse")), { once: true });
+  });
+  if (my !== token) return;
+
+  const sb = ms.addSourceBuffer(mseType);
+  const base = t.pos + 512;
+  const parts = [];
+  let off = 0, started = false;
+  const sa = ["track", t.source, t.vocals, fallbackUsed];
+
+  try {
+    while (off < t.size) {
+      if (my !== token) return;
+      const n = off === 0 ? STREAM_FIRST : STREAM_CHUNK;
+      const end = Math.min(off + n, t.size) - 1;
+      const bytes = await range(t.path, base + off, base + end);
+      if (my !== token) return;
+      parts.push(bytes);
+      current.blob = new Blob(parts, { type: mime });
+      off = end + 1;
+      if (sb.updating) await new Promise(r => sb.addEventListener("updateend", r, { once: true }));
+      // slice: appendBuffer інколи нейтралізує underlying ArrayBuffer
+      await appendBuf(sb, bytes.slice());
+      if (!started) {
+        started = true;
+        setStatus(...sa, false, pctOf(t));
+        fallbackUsed = false;
+        audio.play().catch(() => setStatus(...sa, true, pctOf(t)));
+      }
+    }
+    if (my === token && ms.readyState === "open") ms.endOfStream();
+  } finally {
+    if (my === token) audioBusy = false;
+  }
+}
+
+async function show(t, my, back) {
+  setStatus("loading");
+  // пріоритет playback: поки тягнемо байти треку — probe не займає 6 слотів до HF
+  audioBusy = true;
+  const mime = MIME[t.ext];
+  const mse = mseMime(t.ext);
+  if (mse) {
+    try {
+      await showStream(t, my, back, mime, mse);
+      return;
+    } catch {
+      if (my !== token) return;
+      audioBusy = true;   // стрім не вийшов — качаємо цілком
+    }
+  }
+  await showFull(t, my, back, mime);
 }
 
 async function next(fixed, back) {
@@ -860,7 +951,7 @@ document.addEventListener("keydown", e => { if (e.key === "Escape") closeMetaMod
 
 // ---------- збереження файлу ----------
 $("dl").onclick = () => {
-  if (!current) return;
+  if (!current?.blob) return;
   const a = document.createElement("a");
   a.href = URL.createObjectURL(current.blob);
   a.download = current.title.replace(/[^\p{L}\p{N} _-]+/gu, "").trim().slice(0, 80) + "." + current.ext;
